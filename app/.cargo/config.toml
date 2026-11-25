@@ -1,0 +1,1 @@
+# Intentionally empty: the dependency pins in Cargo.toml avoid raw-dylib imports, so no dlltool is needed.

@@ -1,0 +1,25 @@
+# Rust build output
+target/
+**/*.rs.bk
+*.pdb
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Craft Anything workspace files (reverse-engineering notes, logs and check runs)
+/craft.json
+/feed.json
+/questions.json
+/usage.json
+/build-activity.log
+/capture/
+/checks/
+/inbox/
+/investigation.cany/
+/pinned/
+/reference/

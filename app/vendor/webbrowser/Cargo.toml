@@ -1,0 +1,12 @@
+[package]
+name = "webbrowser"
+version = "1.0.1"
+edition = "2021"
+publish = false
+description = "Local stand-in for the webbrowser crate: opens a URL with the system shell. The upstream crate links shlwapi, which the self-contained GNU toolchain does not ship."
+
+[lib]
+path = "lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

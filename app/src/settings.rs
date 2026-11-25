@@ -1,0 +1,151 @@
+//! Application settings (Misc Settings keys from 0x140081dc0 / 0x140085980), stored as JSON.
+
+use crate::plugins::PluginInfo;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCommand {
+    NextPatch,
+    PreviousPatch,
+    PlayPause,
+    ReturnToZero,
+    TapTempo,
+}
+
+impl AppCommand {
+    pub const ALL: [AppCommand; 5] =
+        [AppCommand::NextPatch, AppCommand::PreviousPatch, AppCommand::PlayPause, AppCommand::ReturnToZero, AppCommand::TapTempo];
+    pub fn label(self) -> &'static str {
+        match self {
+            AppCommand::NextPatch => "Next Patch",
+            AppCommand::PreviousPatch => "Previous Patch",
+            AppCommand::PlayPause => "Play/Pause",
+            AppCommand::ReturnToZero => "Return to Zero",
+            AppCommand::TapTempo => "Tap Tempo",
+        }
+    }
+}
+
+/// An application mapping: a MIDI CC (channel 0 = any) or an OSC address that triggers a command.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AppMapping {
+    pub osc: bool,
+    pub cc: u8,
+    pub channel: u8,
+    pub address: String,
+    pub command: AppCommand,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct AudioConfig {
+    pub backend: String,
+    pub device: String,
+    pub input_device: String,
+    pub sample_rate: f64,
+    pub buffer_size: u32,
+    pub input_channels: Vec<u32>,
+    pub output_channels: Vec<u32>,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        AudioConfig {
+            backend: "Windows Audio".into(),
+            device: String::new(),
+            input_device: String::new(),
+            sample_rate: 0.0,
+            buffer_size: 0,
+            input_channels: vec![0, 1],
+            output_channels: vec![0, 1],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Settings {
+    pub loop_patches: bool,
+    pub windows_on_top: bool,
+    pub ignore_pin_names: bool,
+    pub midi_program_change: bool,
+    pub mmc_transport: bool,
+    pub use_tray_icon: bool,
+    pub start_in_tray: bool,
+    pub fixed_size_windows: bool,
+    pub pdl_audio_settings: bool,
+    pub auto_mappings_window: bool,
+    pub osc_port: u16,
+    /// Empty for a one-to-one connection.
+    pub osc_multicast: String,
+    pub audio_input: bool,
+    pub midi_input: bool,
+    pub osc_input: bool,
+    pub audio: AudioConfig,
+    pub midi_inputs: Vec<String>,
+    pub plugins: Vec<PluginInfo>,
+    pub vst2_folders: Vec<String>,
+    pub vst3_folders: Vec<String>,
+    pub app_mappings: Vec<AppMapping>,
+    pub colour_scheme: String,
+    pub last_file: String,
+}
+
+impl Default for Settings {
+    /// The defaults the original reads its settings with (see MECHANICS.md, Misc settings).
+    fn default() -> Self {
+        Settings {
+            loop_patches: true,
+            windows_on_top: false,
+            ignore_pin_names: false,
+            midi_program_change: false,
+            mmc_transport: false,
+            use_tray_icon: false,
+            start_in_tray: false,
+            fixed_size_windows: true,
+            pdl_audio_settings: false,
+            auto_mappings_window: true,
+            osc_port: 5678,
+            osc_multicast: String::new(),
+            audio_input: true,
+            midi_input: true,
+            osc_input: true,
+            audio: AudioConfig::default(),
+            midi_inputs: Vec::new(),
+            plugins: Vec::new(),
+            vst2_folders: vec![
+                r"C:\Program Files\VSTPlugins".into(),
+                r"C:\Program Files\Steinberg\VSTPlugins".into(),
+                r"C:\Program Files\Common Files\VST2".into(),
+                r"C:\Program Files\Common Files\Steinberg\VST2".into(),
+            ],
+            vst3_folders: vec![r"C:\Program Files\Common Files\VST3".into()],
+            app_mappings: Vec::new(),
+            colour_scheme: "default".into(),
+            last_file: String::new(),
+        }
+    }
+}
+
+pub fn dir() -> PathBuf {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join("PedalboardHost")
+}
+
+impl Settings {
+    pub fn load() -> Settings {
+        std::fs::read_to_string(dir().join("settings.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let d = dir();
+        let _ = std::fs::create_dir_all(&d);
+        if let Ok(t) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(d.join("settings.json"), t);
+        }
+    }
+}

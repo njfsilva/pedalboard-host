@@ -1,0 +1,66 @@
+[package]
+name = "pedalhost"
+version = "0.1.0"
+edition = "2021"
+description = "Live VST2/VST3 effects host for performers, rebuilt with Rust and egui"
+license = "GPL-3.0-or-later"
+readme = "../README.md"
+keywords = ["audio", "vst", "vst3", "asio", "effects"]
+categories = ["multimedia::audio"]
+publish = false
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.31"
+cpal = "0.15"
+rtrb = "0.3"
+roxmltree = "0.20"
+hound = "3.5"
+midir = "0.10"
+rfd = { version = "0.15", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Pinned to versions that link Windows DLLs through import libraries. Their newer releases use
+# raw-dylib, which needs dlltool plus an assembler that the GNU toolchain doesn't ship.
+parking_lot = "=0.12.3"
+parking_lot_core = "=0.9.10"
+libloading = "=0.8.6"
+arboard = { version = "=3.4.1", default-features = false }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_Media",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+] }
+
+# The audio path has to be fast even in a plain `cargo build`, so debug builds are optimised too.
+[profile.dev]
+opt-level = 2
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# The upstream crate links shlwapi directly, which the self-contained GNU toolchain lacks.
+[patch.crates-io]
+webbrowser = { path = "vendor/webbrowser" }
