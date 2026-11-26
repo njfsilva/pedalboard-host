@@ -182,5 +182,5 @@ Pedalboard Host is free software: you can redistribute it and/or modify it under
 
 ## Acknowledgements
 
-- **Pedalboard2** by Niall Moody, the original application this project recreates
+- **[Pedalboard2 by Niall Moody](https://www.niallmoody.com/work/pedalboard2/)**, the original application this project recreates
 - [egui / eframe](https://github.com/emilk/egui), [cpal](https://github.com/RustAudio/cpal), [midir](https://github.com/Boddlnagg/midir), [rtrb](https://github.com/mgeier/rtrb), [hound](https://github.com/ruuda/hound), [roxmltree](https://github.com/RazrFalcon/roxmltree)
