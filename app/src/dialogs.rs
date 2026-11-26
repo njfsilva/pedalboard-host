@@ -48,7 +48,13 @@ pub struct Dialogs {
     pub app_maps: bool,
     pub app_draft: AppMapDraft,
     pub organiser: bool,
-    pub organiser_sel: usize,
+    /// The organiser's selected rows and in-place rename while it's open.
+    pub organiser_state: crate::editors::OrganiserState,
+    /// How many times the organiser has been opened, so each opening is a fresh window in the
+    /// middle at the original's size, as the original builds a new one each time (0x1400384e4).
+    pub organiser_opens: u32,
+    /// The organiser's "Select patch..." box, open after Import... read a file.
+    pub import: Option<crate::editors::ImportPick>,
     pub presets: Option<crate::editors::PresetState>,
     pub mappings: Option<u32>,
     pub map_draft: crate::editors::MapDraft,
@@ -235,6 +241,11 @@ fn commit_osc_text(s: &mut Settings, port: &mut String, group: &mut String) {
 
 impl App {
     pub fn windows(&mut self, ctx: &Context) {
+        // The organiser's "Select patch..." box goes first so its Enter and Escape reach it before
+        // any window under it reads them.
+        if self.dlg.import.is_some() {
+            self.import_window(ctx);
+        }
         self.editor_windows(ctx);
         self.message_window(ctx);
         self.confirm_window(ctx);

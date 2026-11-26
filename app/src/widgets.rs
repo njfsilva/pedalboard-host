@@ -182,6 +182,21 @@ pub fn gradient_rrect(p: &egui::Painter, r: Rect, rad: f32, top: Color32, bottom
     p.add(Shape::mesh(m));
 }
 
+/// The bevel JUCE draws inside text boxes (drawBevel, 0x1401f0d10): `n` one-pixel rings inside `r`,
+/// the outermost at full strength and each further in weaker by 1/n, the sides at 0.75 of that.
+pub fn bevel(p: &egui::Painter, r: Rect, n: u32, col: Color32) {
+    let line = |x: f32, y: f32, w: f32, h: f32, c: Color32| p.rect_filled(Rect::from_min_size(pos2(x, y), egui::vec2(w, h)), CornerRadius::ZERO, c);
+    for i in 0..n {
+        let f = i as f32;
+        let op = (n - i) as f32 / n as f32;
+        let (edge, side) = (col.gamma_multiply(op), col.gamma_multiply(op * 0.75));
+        line(r.left() + f, r.top() + f, r.width() - 2.0 * f, 1.0, edge);
+        line(r.left() + f, r.top() + f + 1.0, 1.0, r.height() - 2.0 * f - 2.0, side);
+        line(r.left() + f, r.bottom() - f - 1.0, r.width() - 2.0 * f, 1.0, edge);
+        line(r.right() - f - 1.0, r.top() + f + 1.0, 1.0, r.height() - 2.0 * f - 2.0, side);
+    }
+}
+
 /// The bevelled button of the original's look: soft vertical gradient and a dark rim.
 pub fn button_face(p: &egui::Painter, r: Rect, rad: f32, c: &Scheme, down: bool, hover: bool) {
     let base = c.get(colours::BUTTON);

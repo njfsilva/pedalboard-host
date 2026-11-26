@@ -368,6 +368,133 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
     - The box's fill, outline, shadow and arrow size are **estimated**: the rebuild uses the window colours and the stock JUCE call-out geometry (20 px border, arrow at the patch list's top).
   - MMC stop/pause, play and rewind drive the main transport while "mmcTransport" is on (read at 0x140054b73). The mapping of messages to actions is **estimated**.
 
+## Patch Organiser (constructor 0x14005c440, resized 0x14005d760, paint 0x14005d660, buttonClicked 0x14005d870)
+
+- **Opening** (menu command 0x1400384e4): the "Patch Organiser" menu item (string 0x1404112d0, help text "Opens the patch organiser." at 0x140410c58).
+  - The constructor asks for 600 × 400 (0x14005d499), but the menu command makes the content 400 × 300 (bytes at 0x1400384d6, setBounds 0x1401abc10) before showing it.
+  - The dialog helper 0x140030940 shows it: titled "Patch Organiser" (used at 0x140038533), on "Window Background", centred, with a resizable border (0x14021d340, 0x1401e00d0). Escape closes it. It's only kept on top when the program isn't running stand-alone, so not here.
+  - It runs modally (runModalLoop 0x1401acc50) and is built new each time, so it always opens with nothing selected.
+  - **Rebuild:** a resizable window that opens centred at 400 × 300 with nothing selected.
+    - It leaves the main window usable, and Escape doesn't close it, like the rebuild's other windows (**rebuild's own**).
+    - It can't be made smaller than 200 × 248, which keeps Move Down in view. The original sets no limit (**estimated**).
+- **Patch list** ("patchList", 0x1404143d0, created at 0x14005c57d):
+  - It sits at (8, 8, w − 106, h − 15) (resized) on "Dialog Inner Background".
+    - Its 1 px outline (constructor) is JUCE's ListBox outline colour 0xb2808080 (colour table 0x140424648).
+    - Several rows can be selected at once (constructor).
+  - **Rows** are 22 px high (ListBox constructor 0x140202670, value at 0x140202755). Each is a JUCE Label (constructor 0x1401fffb0):
+    - 15 px text (0x14043394c), centred left;
+    - 5 px in from the sides and 1 px from the top and bottom;
+    - squeezed sideways down to 70% when the name is too long.
+  - **Row text** is the patch's "name" attribute (0x14041080c, refreshComponentForRow 0x14005f020), with no number.
+    - The original names a new patch "N - <untitled>" (comboBoxChanged 0x140035df0).
+    - The rebuild stores new patches as "<untitled>" and shows them here as "N - <untitled>".
+  - **Painting** (paintListBoxItem 0x14005ee30):
+    - Every second row (1, 3, 5… counting from 0) is tinted black at alpha 0x10 (0x10000000, at 0x14005efdd).
+    - A selected row is filled top to bottom with a gradient (0x1401470f0). It runs from "List Selected Colour" brightened by 0.4 (0x14042f6b8) to the same colour darkened by 0.125 (0x14043e348).
+      - Colour::brighter (0x140146b90) gives 255 − (255 − c) ÷ 1.4.
+      - Colour::darker (0x140146c30) gives c ÷ 1.125.
+    - The text is white on selected rows and black on the others (Label text colour, id 0x1000281).
+  - The scroll bar is JUCE's usual 18 px (**estimated**).
+- **Clicks** (listBoxItemClicked 0x14005f2c0, backgroundClicked 0x14005f370):
+  - A click selects only that row.
+  - With Ctrl the row joins the selection. Ctrl can't take a row out again, because the handler selects the row right after JUCE flips it.
+  - Shift works like a plain click, and a right-click selects too.
+  - Clicking the empty space below the rows clears the selection (deselectAllRows 0x1402030e0).
+  - Selecting never switches the playing patch.
+  - The rebuild doesn't move the selection with the arrow keys (**rebuild's own**).
+- **Renaming in place:** double-clicking a row opens a text box over it. The Label edits on double-click only (Label::showEditor 0x140200d40, createEditorComponent 0x1402012d0).
+  - All the text is selected and the box takes the keyboard.
+  - A click anywhere else keeps the new name (showEditor's modal state; losing the keyboard doesn't discard it, refreshComponentForRow). Return keeps it too and Escape drops it, as JUCE's Label does (**estimated**).
+  - **The box** (TextEditor constructor 0x14020c050) has a 1 px border (3 px on the right) and a 4 px indent, so its text starts 5 px in from the left and the top.
+    - The Label gives it black text on a clear background, so the row's fill shows through.
+  - **While it has the keyboard** (drawTextEditorOutline 0x1401e7b60), it gets:
+    - a 2 px outline in "Menu Selection Colour" (the original's look, 0x1400211e0);
+    - a 4 px inner shadow of 0x38000000 (0x14042458c) at 0.75 strength (0x140433888).
+    - The shadow is drawBevel (0x1401f0d10): ring i of 4 at strength (4 − i) ÷ 4, its sides at 0.75 of that. It's drawn 2 px taller than the box, so most of its bottom edge falls outside.
+  - Selected text sits on "Button Highlight" (0x1400211e0). The caret and the selected text keep the default black (colour table 0x140424594 and 0x140424574).
+  - egui places text on whole pixels, so the rebuild's text moves down 1 px when the box opens, where the original's moves 1.5 px. egui's selection band is also a little taller than the 15 px line (**estimated**).
+  - labelTextChanged (0x14005f380) applies the new name: it renames the patch and its entry in the main window's patch list.
+    - The original doesn't mark the file changed.
+    - The rebuild does, so a rename isn't lost when the program closes (**rebuild's own**).
+- **Buttons:** 82 × 24 at x = w − 90 (resized). The labels and tooltips are set in the constructor.
+
+  | Button | Label | Tooltip | y in the original | y in the rebuild |
+  |---|---|---|---|---|
+  | Add | "Add" | "Add a new patch" (0x140414500) | 8 | 8 |
+  | Copy | 0x140414420 | "Duplicate selected patch" (0x140414520) | 40 | 40 |
+  | Remove | 0x140414450 | "Delete selected patch" (0x140414558) | 72 | 72 |
+  | Import... | 0x1404144e8 | "Import patch from another .pdl file" (0x1404145d0) | 104 | 104 |
+  | Export... | rebuild's own | "Export selected patch to a .pdl file" (**estimated**) | none | 136 |
+  | Move Up | 0x140414480 | "Move patch up" (0x140414588) | 152 | 184 |
+  | Move Down | 0x1404144b0 | "Move patch down" (0x1404145a8) | 184 | 216 |
+
+- **Separator:** a line at (w − 89, 140, 80, 1) in black at alpha 0x40 separates Import... from the move buttons (paint).
+  - The rebuild draws it at y 172 and moves both move buttons 32 px down to make room for Export... (**estimated**).
+- **Button text** (drawButtonText 0x140021bb0):
+  - "Text Colour", at half strength when the button is greyed out;
+  - 8 px in from each side of an 82 × 24 button;
+  - 1 px right and down while the button is held.
+  - The original allows two lines. The rebuild keeps one line, squeezed sideways when it doesn't fit, in its own 14 px button font (**estimated**).
+- **Button rules (buttonClicked 0x14005d870):**
+  - **Add** picks "<new patch>" in the main window's patch list (comboBoxChanged 0x140035df0): a new patch at the end, which starts playing.
+  - **Copy** saves the playing patch first, then adds each selected row, lowest first, to the end of the list as "<name> (copy)" and marks the file changed (0x14003cf90). The selection and the playing patch stay.
+  - **Remove** takes the selected rows out, last first, while more than one patch is left. With fewer than 2 patches it does nothing (the test at the start of its branch).
+  - **Move Up and Move Down** swap the lowest selected row with its neighbour and leave that row as the only one selected. Move Up needs a row above it, and Move Down a row below it.
+  - **Not copied from the original:**
+    - **After Remove**, the original switches to patch 1 (setSelectedId(1)) and saves the old patch into a row number that has already shifted.
+      - The rebuild keeps the playing patch.
+      - If that patch is removed, the one above it plays (the one below for row 0).
+    - **After a move**, the original switches to patch 1 and loses unsaved changes to the playing patch.
+      - It sets its "don't save" flag first (MainPanel + 0x5030, also used at 0x140033d2c, 0x140039765, 0x140039772, 0x14005d72d, 0x14005df86 and 0x14005e240).
+      - It doesn't mark the file changed.
+      - The rebuild keeps the playing patch wherever it moves to, and marks the file changed.
+    - **Move Down with nothing selected** blanks patch 1 in the original. The rebuild greys it out.
+  - **Greyed-out buttons:** the rebuild greys out buttons that would do nothing. The original's handler just ignores those clicks (**estimated**, appearance only).
+    - Copy, Remove and Export... need a selection.
+    - Remove needs at least 2 patches.
+    - The move buttons need room to move.
+- **Import...** (the last branch of buttonClicked):
+  1. **Choosing the file:** a file chooser titled "Select file to import patch from..." (0x140414630, used at 0x14005e2ab) with the filter "*.pdl" and no starting file (File()), so Windows picks the folder.
+     - The rebuild starts in the open file's folder (**estimated**).
+  2. **Reading it:** the file is read as XML (XmlDocument::getDocumentElement).
+     - When that fails, the original does nothing.
+     - The rebuild says "Could not import a patch from …" (**rebuild's own**).
+  3. **Listing the patches:** every child of the root whose tag is "Patch" (0x140411484, compared with _stricmp, so case doesn't matter) is listed by its "name" attribute (0x14041080c).
+     - The root's own tag isn't checked.
+     - A patch with no name is listed blank in the original; the rebuild shows "<untitled>" (the original's own placeholder, 0x1404107f0) (**estimated**).
+  4. **"Select patch..."** (0x140414690, used at 0x14005e948) is an AlertWindow (0x140216750) with no icon. It holds:
+     - the message "Patches in file: " (0x140414678) followed by the file's name (getFileName 0x140112380);
+     - a combo box named "patchName" (0x1404146b0, addComboBox 0x140217340) with the first patch selected;
+     - "OK" (0x1404146bc, return value 1, Return key 0x0d) and "Cancel" (0x1404146c8, return value 0, Escape key 0x1b), both added by addButton 0x140216e60.
+     - It runs modally (runModalLoop 0x1401acc50). The rebuild blocks the rest of the window while it's open.
+  5. **OK:** the original copies the first "Patch" element whose name equals the chosen one (0x14012be90, then 0x14012b940) and passes it to addPatch (0x14003cbd0). addPatch:
+     - adds it at the end of the patch list;
+     - renames the main window's "<new patch>" entry to the patch's name and adds a new "<new patch>" entry after it;
+     - marks the file changed;
+     - doesn't switch to the new patch.
+  6. **Differences in the rebuild:**
+     - It takes the chosen row itself. This only differs when two patches share a name, where the original always takes the first (**estimated**).
+     - With no patches in the file, the original's OK would copy nothing; the rebuild greys OK out (**estimated**).
+- **"Select patch..." layout (JUCE AlertWindow::updateLayout 0x140217bc0):**
+  - **Fonts:** the message font is 15 px plain: Pedalboard2's own look-and-feel (BranchesLAF, table at 0x140283998) returns Font(15.0) from slot 0x70 (0x140023670, 15.0 at 0x14043394c). The title is that font × 1.1 (0x14043b888), in bold.
+  - **First wrap width:** min(300 + 2·floor(√(15 × widest)), floor(0.7 × screen width)) (0.7 at 0x14041db74). "Widest" is the wider of the title and the message, both measured in the message font.
+  - **Line balancing** (createLayoutWithBalancedLineLengths 0x140188e30, constants 0.5, 10.0 and 0.9) stops at once. It tests longest ÷ shortest line > 0.9, which always holds, so the text keeps the first wrap width.
+  - **Text:** the title rows start 10 px down, then a blank message-font row, then the message. Text bottom = 40 + floor(text height).
+  - **Width:** max(350, text width + 40), at most 0.7 × the screen width.
+  - **Height:** text bottom + 50 per combo box + 20 + the button height, at most the screen height − 50.
+  - **Combo box:** at (round(0.1 w), text bottom, round(0.8 w), 22) (0.1 at 0x14042f1fc, 0.8 at 0x140435d68).
+  - **Buttons:** each is 28 high (BranchesLAF slot 0x68, 0x1401e47d0, read by addButton 0x140216e60) and its text width + 28 wide (changeWidthToFitText 0x1401baa00). They sit 16 apart, centred, with their bottoms at round(0.95 h) (0x14043ce98).
+  - **Colours:** window background fill with a 1 px grey (0x66) outline (**estimated**).
+- **Export...** (**rebuild's own**: the original organiser has no export):
+  - **What it writes:** the selected patches, in list order, in a new patch file. The playing patch goes in with its latest changes.
+    - The root is "Pedalboard2PatchFile", with one "Patch" element per patch (name and tempo as Save writes them) and no "DEVICESETUP".
+    - Open and Import... both read it.
+  - **The file chooser** is titled "Select file to export patch to...". It adds ".pdl" when no extension is typed. It suggests:
+    - for one patch, its name (or "Untitled") with ".pdl";
+    - for several, "Patches.pdl".
+  - **Safety:** it refuses to write over the open patch file, which would lose that file's other patches.
+  - **No side effects:** it doesn't change the open file, its changed flag or the recent file.
+
 ## Misc settings window (constructor 0x140081dc0, buttonClicked 0x140085980)
 
 - **Size:** 560 × 530 (setSize at 0x140085077); the window isn't resizable.

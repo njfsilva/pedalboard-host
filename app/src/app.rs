@@ -83,6 +83,16 @@ impl Patch {
     pub fn untitled(tempo: f64) -> Patch {
         Patch { name: UNTITLED.into(), tempo, el: None }
     }
+
+    /// The patch as a .pdl file holds it: a `Patch` element with its name and tempo around its
+    /// stored boxes (none yet for a new patch).
+    pub fn to_el(&self) -> El {
+        let mut e = self.el.clone().unwrap_or_else(|| El::new("Patch"));
+        e.name = "Patch".into();
+        e.set("name", &self.name);
+        e.set("tempo", format!("{:.2}", self.tempo));
+        e
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -458,18 +468,7 @@ impl App {
     pub fn document(&mut self) -> El {
         self.store_current();
         let mut root = El::new("Pedalboard2PatchFile");
-        for p in &self.patches {
-            let tempo = format!("{:.2}", p.tempo);
-            root.children.push(match &p.el {
-                Some(e) => {
-                    let mut e = e.clone();
-                    e.set("name", &p.name);
-                    e.set("tempo", &tempo);
-                    e
-                }
-                None => El::new("Patch").attr("name", &p.name).attr("tempo", &tempo),
-            });
-        }
+        root.children.extend(self.patches.iter().map(Patch::to_el));
         if self.settings.pdl_audio_settings {
             root.children.push(device_el(&self.settings.audio));
         }
@@ -535,7 +534,7 @@ impl App {
         }
     }
 
-    fn pdl_dialog(&self) -> rfd::FileDialog {
+    pub fn pdl_dialog(&self) -> rfd::FileDialog {
         let mut d = rfd::FileDialog::new().add_filter("Patch files", &["pdl"]);
         if let Some(dir) = Path::new(&self.settings.last_file).parent().filter(|d| d.is_dir()) {
             d = d.set_directory(dir);
@@ -609,7 +608,13 @@ impl App {
                 self.egui_ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             Cmd::DeleteConnections => self.delete_selected(),
-            Cmd::OrganisePatches => self.dlg.organiser = true,
+            Cmd::OrganisePatches => {
+                if !self.dlg.organiser {
+                    self.dlg.organiser_state = Default::default();
+                    self.dlg.organiser_opens += 1;
+                }
+                self.dlg.organiser = true;
+            }
             Cmd::UserPresets => self.dlg.presets = Some(Default::default()),
             Cmd::MiscSettings => self.dlg.misc = true,
             Cmd::AudioSettings => self.dlg.open_audio(&self.settings, &self.engine),
@@ -809,7 +814,8 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &Context) {
-        if ctx.wants_keyboard_input() {
+        // A modal box (the organiser's "Select patch...") takes every key, as JUCE's modal loop does.
+        if ctx.wants_keyboard_input() || ctx.memory(|m| m.top_modal_layer().is_some()) {
             return;
         }
         let mut cmds = Vec::new();
