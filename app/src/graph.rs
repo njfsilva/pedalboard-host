@@ -268,9 +268,6 @@ impl Graph {
     pub fn node_mut(&mut self, id: u32) -> Option<&mut Node> {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
-    pub fn has_processors(&self) -> bool {
-        self.nodes.iter().any(|n| !n.is_io())
-    }
 
     fn alloc_id(&mut self) -> u32 {
         self.next_id = self.next_id.max(1);

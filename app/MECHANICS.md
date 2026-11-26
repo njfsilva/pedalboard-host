@@ -40,7 +40,7 @@ Other window values:
   - The track is shaded across its width.
   - The arrows are 2 px chevrons.
 - **Field bevel:** a dark line along the top, then a light line; a light line on the left (measured).
-- **Fonts:** Verdana, JUCE's default on Windows. Sizes: bottom bar 15, box titles 13, pin labels 12, hint 14 (measured). Text baselines are rounded to whole pixels, as JUCE does.
+- **Fonts:** Verdana, JUCE's default on Windows. Sizes: bottom bar 15, box titles 13, pin labels 12, hint 14 (JUCE's default, as the field's paint 0x140078d80 sets no font). Text baselines are rounded to whole pixels, as JUCE does.
 - **Tooltips:** "Previous patch", "Next patch", "Tap tempo", "Play (main transport)", "Return to zero (main transport)".
 
 ## Menus (strings at 0x1404108a0–0x140411300)
@@ -108,7 +108,38 @@ Colour-scheme files:
   - Audio Input at (10, 10), Midi Input at (10, 120) and Audio Output at (892, 10), set in 0x14002cc30.
   - OSC Input at (10, 215), set in 0x14007b120.
   - The hidden "Midi Interceptor" node is not drawn.
-- **Hint:** "<double-click to add processor>" in Text Colour at 50 % alpha, shown while the patch has no processors. Its position was measured.
+- **Empty-field hint (PluginField paint 0x140078d80):** after filling Field Background, it draws "<double-click to add processor>" with drawText into the rectangle (400, 230, 300, 30) in field coordinates, so it scrolls with the field and doesn't follow the window size.
+  - Justification 0x21 is centred-left: the text starts at x = 400 and is centred vertically in the 30 px. Paint sets no font, so JUCE's default 14 applies. The colour is Text Colour with its alpha multiplied by 0.5 (0x14042ee44).
+  - It shows while the flag at PluginField + 0x298 is set. Only the constructor (0x140077df0) sets it, at 0x140078036. It's cleared after a processor is added from the add menu (0x140079160), after a dropped file adds one (0x14007a418), and by clearDoubleClickMessage (0x140080130), which switchPatch (0x140039720, call at 0x140039979) runs after loading a stored patch. So the hint doesn't come back when every processor is deleted.
+  - The rebuild hides it the same way: when a processor is added from the panel, and when a stored patch loads.
+- **Add menu (PluginField mouseDown 0x140078fc0):** opens at the mouse on the press that makes exactly a double-click (getNumberOfClicks() == 2), with any button, on empty field.
+  - Contents: KnownPluginList::addToMenu (0x140101280) on the tree from createTree (0x140101400), sorted alphabetically. That's one flat list with no headings or folders. Each item is the plain name, enabled and unticked, with id = list index + 0x324503F4.
+  - The list holds every scanned plugin plus the 7 built-ins. The MainPanel constructor (0x140032030) adds the built-ins with KnownPluginList::addType (0x1400ffad0) at 0x140034439..0x140034514, in the order Level, File Player, Output Toggle, VU Meter, Audio Recorder, Metronome, Looper (category "Pedalboard Processors", format "Internal", 0x140062f80). The Audio, Midi and OSC boxes and the Midi Interceptor are not in it.
+  - Sorting: by name with compareLexicographically (0x140120080). It skips leading characters that aren't letters or digits (iswalnum), then compares the rest with _stricmp, which lowers A-Z and compares bytes, so "_" sorts before the letters. Inserting uses findInsertIndexInSortedArray (0x140105e30), which puts an equal name after the ones already there.
+  - Equal names therefore keep the plugin list's order. The saved list loads first (recreateFromXml 0x140100ec0, called at 0x140034302), and addType then keeps a saved built-in's place or appends it, so the built-ins lead unless the list was re-sorted. The rebuild lists the built-ins first, then the plugins in list order.
+  - Rebuild additions (**estimated**): VST3 plugins get " (VST3)" after their name, since the original couldn't load them. Items show tips (built-in description, plugin maker). The list scrolls past 440 px instead of splitting into JUCE's columns. A "No plugins yet" line shows when no plugins are scanned.
+- **Adding a processor (addFilter 0x14002c6b0):**
+  - When the processor can't be created, a message titled "Couldn't create filter" (0x14040ffa8) shows the error (0x140218bd0). The rebuild uses that title and also names the plugin.
+  - Otherwise it stores the click's whole-pixel x and y as the node's "x" (0x14040ff9c) and "y" (0x14040ffa0) properties, and wraps every processor except the I/O boxes in a bypass wrapper (0x1400013a0).
+  - The new box (0x14007b550) reads them back with toInt and calls setBounds (0x1401abc10, at 0x14007b866), so its top-left lands on the click point. The rebuild floors the press point to whole field pixels and puts the box there.
+- **Dropping files on the field (0x140079a10):** the original checks a dropped file's extension against .dll and the sound types .wav, .aif, .aiff, .ogg, .flac and .wma (strings 0x140417370..0x140417398, 0x140283690), and adds a box where it lands. Plugins go through addFilter. A sound file gets a processor built for it (0x140064150, used only here, probably a File Player), added through 0x14002c9a0. **Not in the rebuild yet.**
+- **Double-clicks (JUCE getNumberOfMultipleClicks, 0x1401b4ae0):**
+  - The last 4 presses are kept.
+  - An earlier press i (1 = the press just before) joins the current one when all of these hold:
+    - it came less than 400 ms × min(i, 2) before it (imul at 0x1401b4b42);
+    - it lies less than 8 px away on each axis (0x1401b4b74, 0x1401b4b84);
+    - it used the same buttons;
+    - it landed in the same window.
+  - Counting stops at the first press that doesn't join.
+  - The system's double-click time isn't read.
+  - Only a count of exactly 2 opens the menu. A quick third press closes it and leaves it shut, as in the original. The rebuild's "same window" means the field versus a dialog or menu over it.
+- **Right-click menus (rebuild additions, all **estimated**):** the original has no single-right-click menu. No box menu strings exist; "Open plugin editor" (0x140416940) and "Open mappings editor" (0x140416958) are only the button tips in 0x1400716c0. The rebuild adds:
+  - A right-button press on empty field opens the add panel at once, on the press like the original's double-click.
+  - A right-click on a processor box opens its menu when the button comes up within 6 px of the press; further, it is a right-drag that moves the box. The menu has Open plugin editor, Open mappings editor, Programs (when the plugin has more than one), User presets... (plugins only), Bypass, then Delete.
+  - Right-clicks on cables and on the Audio/Midi/OSC boxes do nothing.
+  - One menu shows at a time. It closes on a choice, on a press outside it (which still acts on what it lands on), on Escape, when the window loses focus, when its box is deleted, or when another patch loads.
+  - Presses on dialogs or other menus over the field don't count as field presses; presses on tooltips do.
+  - The field reads the mouse presses itself rather than egui's click and button-held state, so a button release lost outside the window can't leave a menu stuck or swallowing clicks.
 - **Box buttons (PluginComponent constructor 0x1400716c0):** on every box except Audio Input, Midi Input, Audio Output and OSC Input. Bounds are in the box component's coordinates (W × H):
   - "e": TextButton (10, H − 30, 20, 20), tip "Open plugin editor", on every processor (see Editor windows).
   - "m": TextButton (32, H − 30, 24, 20), tip "Open mappings editor".

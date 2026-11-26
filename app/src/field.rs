@@ -47,14 +47,69 @@ struct Pin {
     at: Pos2,
 }
 
+/// The one open menu: the add panel (its screen corner, and where a new box goes in the field)
+/// or a processor box's menu (and whether its Programs list is open).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Popup {
+    Add { screen: Pos2, at: Pos2 },
+    Box { node: u32, screen: Pos2, programs: bool },
+}
+
+/// What a press on the field lands on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target {
+    Empty,
+    Cable,
+    /// Audio/Midi/OSC Input or Audio Output, which have no menu.
+    Io,
+    Box(u32),
+}
+
+/// A mouse press, remembered for counting double-clicks.
+#[derive(Clone, Copy)]
+struct Press {
+    pos: Pos2,
+    time: f64,
+    button: PointerButton,
+    on_field: bool,
+}
+
+/// Double-clicks (0x1401b4ae0): the last 4 presses are kept, and an earlier press joins the
+/// current one when it came less than 400 ms × min(i, 2) before it and lies less than 8 px away
+/// on each axis (i = 1 for the press just before).
+const CLICK_PRESSES: usize = 4;
+const CLICK_TIME: f64 = 0.4;
+const CLICK_DIST: f32 = 8.0;
+/// The empty-field hint (PluginField paint 0x140078d80): drawn into (400, 230, 300, 30) in field
+/// coordinates, centred left, in Text Colour at half its alpha (0x14042ee44).
+const HINT: &str = "<double-click to add processor>";
+const HINT_RECT: Rect = Rect { min: pos2(400.0, 230.0), max: pos2(700.0, 260.0) };
+const HINT_ALPHA: f32 = 0.5;
+/// How far a right-button press on a processor box may travel before its release stops counting
+/// as a click (egui's own click distance); further, it is a drag that moves the box.
+const RIGHT_CLICK_DIST: f32 = 6.0;
+/// The areas the field's menus are drawn in.
+const ADD_MENU: &str = "add_menu";
+const BOX_MENU: &str = "box_menu";
+const PROGRAMS_LIST: &str = "box_menu_programs";
+
 #[derive(Default)]
 pub struct Field {
     pub scroll: Vec2,
     pub selected: Vec<(u32, u32, u32, u32)>,
     wire: Option<Pin>,
-    add_menu: Option<(Pos2, Pos2, bool)>,
+    /// The open menu, and the rectangles it covered when last drawn (the menu, then its list).
+    popup: Option<Popup>,
+    popup_rects: Vec<Rect>,
+    /// Recent presses, newest first.
+    presses: Vec<Press>,
+    /// A right-button press on a processor box waiting for its release: where, and which box.
+    right_press: Option<(Pos2, u32)>,
     /// The box whose title is being edited, the text so far, and whether editing just began.
     rename: Option<(u32, String, bool)>,
+    /// The empty-field hint is gone for good (the flag at PluginField + 0x298, which only the
+    /// constructor sets).
+    hint_hidden: bool,
 }
 
 /// Box size (0x140073d10): pins × 13 + 34 for the I/O boxes, + 60 for processors (room for the
@@ -157,10 +212,45 @@ fn paint_cable(p: &Painter, pts: Vec<Pos2>, col: Color32, selected: bool) {
     }
 }
 
+/// Adds a press to the history and returns how many presses in a row it makes (0x1401b4ae0).
+/// Each earlier press must be within its time window and under 8 px away, with the same button
+/// and on the same surface (the field, or a menu or window over it); the first one that isn't
+/// ends the run.
+fn count_press(history: &mut Vec<Press>, now: Press) -> usize {
+    history.insert(0, now);
+    history.truncate(CLICK_PRESSES);
+    let joins = |i: usize, p: &Press| {
+        now.time - p.time < CLICK_TIME * i.min(2) as f64
+            && (now.pos.x - p.pos.x).abs() < CLICK_DIST
+            && (now.pos.y - p.pos.y).abs() < CLICK_DIST
+            && now.button == p.button
+            && now.on_field == p.on_field
+    };
+    1 + history.iter().enumerate().skip(1).take_while(|(i, p)| joins(*i, p)).count()
+}
+
 impl Field {
     /// Drops an unfinished rename, e.g. when another patch replaces the boxes.
     pub fn stop_rename(&mut self) {
         self.rename = None;
+    }
+
+    /// Closes the add panel or box menu, e.g. when another patch replaces the boxes.
+    pub fn close_popups(&mut self) {
+        self.popup = None;
+        self.popup_rects.clear();
+        self.right_press = None;
+    }
+
+    /// Hides the empty-field hint for good, once a processor is added (mouseDown 0x140078fc0) or
+    /// a stored patch loads (switchPatch 0x140039720 runs clearDoubleClickMessage 0x140080130).
+    pub fn hide_hint(&mut self) {
+        self.hint_hidden = true;
+    }
+
+    fn open(&mut self, popup: Popup) {
+        self.popup = Some(popup);
+        self.popup_rects.clear();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -194,9 +284,10 @@ impl Field {
         p.rect_filled(Rect::from_min_max(vp.min + vec2(0.0, 2.0), pos2(vp.left() + 1.0, vp.bottom())), CornerRadius::ZERO, shade(10));
         p.rect_filled(Rect::from_min_max(pos2(vp.left(), vp.bottom() - 1.0), vp.max), CornerRadius::ZERO, shade(-15));
         p.rect_filled(Rect::from_min_max(pos2(vp.right() - 1.0, vp.top() + 2.0), pos2(vp.right(), vp.bottom() - 1.0)), CornerRadius::ZERO, shade(6));
-        if !g.has_processors() {
-            let at = origin + vec2(485.0 * vp.width() / 992.0, 248.0 * vp.height() / 492.0);
-            text_at(&p, at.x, at.y, Align::Center, "<double-click to add processor>", font(HINT_FONT), Color32::from_black_alpha(128));
+        if !self.hint_hidden {
+            let r = HINT_RECT.translate(origin.to_vec2());
+            let col = colours::draw(colours::mult_alpha(c.straight(colours::TEXT), HINT_ALPHA));
+            text_at(&p, r.left(), baseline(r, HINT_FONT), Align::Min, HINT, font(HINT_FONT), col);
         }
 
         // Cables are added after the boxes they join (0x14007dd40, 0x140080500), so they draw on top
@@ -215,6 +306,64 @@ impl Field {
                 hovered_cable = Some(*conn);
             }
             cables.push((*conn, pts));
+        }
+
+        // Menus follow this frame's raw presses in order. The original opens its add menu on the
+        // press that makes exactly a double-click (a count of 2), with any button (0x140078fc0);
+        // here a right-button press on empty field opens it too. A processor's own menu opens when
+        // the right button comes up again, as a right-drag moves the box instead. None of this waits
+        // on egui's click or button-held state, which a release lost outside the window leaves stale.
+        let (events, now) = fu.input(|i| (i.events.clone(), i.time));
+        let field_layer = fu.layer_id();
+        let own_menus = [ADD_MENU, BOX_MENU, PROGRAMS_LIST].map(Id::new);
+        let target_at = |m: Pos2| {
+            if cables.iter().any(|(_, pts)| hits_cable(pts, m)) {
+                return Target::Cable;
+            }
+            match rects.iter().rposition(|r| r.contains(m)) {
+                Some(i) if g.nodes[i].is_io() => Target::Io,
+                Some(i) => Target::Box(g.nodes[i].id),
+                None => Target::Empty,
+            }
+        };
+        for e in &events {
+            match *e {
+                Event::PointerButton { pos, button, pressed: true, .. } => {
+                    let on_menu = self.popup.is_some() && self.popup_rects.iter().any(|r| r.contains(pos));
+                    if self.popup.is_some() && !self.popup_rects.is_empty() && !on_menu {
+                        self.close_popups();
+                    }
+                    // Dialogs and other menus over the field are areas of their own; the field has
+                    // none. The field's own menus count where they were last drawn, as egui still
+                    // lists a closed one for a frame, and presses go through tooltips, like the
+                    // original's.
+                    let on_field = vp.contains(pos)
+                        && !on_menu
+                        && fu.ctx().layer_id_at(pos).is_none_or(|l| l == field_layer || l.order == Order::Tooltip || own_menus.contains(&l.id));
+                    let clicks = count_press(&mut self.presses, Press { pos, time: now, button, on_field });
+                    let target = if on_field { target_at(pos) } else { Target::Empty };
+                    let secondary = button == PointerButton::Secondary;
+                    if on_field && target == Target::Empty && (clicks == 2 || secondary) {
+                        // The new box's top-left goes on the press, in whole field pixels: addFilter
+                        // (0x14002c6b0) stores the event's int x and y, and 0x14007b550 places the box there.
+                        self.open(Popup::Add { screen: pos, at: (pos - origin).to_pos2().floor() });
+                    }
+                    if secondary {
+                        self.right_press = match target {
+                            Target::Box(node) if on_field => Some((pos, node)),
+                            _ => None,
+                        };
+                    }
+                }
+                Event::PointerButton { pos, button: PointerButton::Secondary, pressed: false, .. } => {
+                    let Some((from, node)) = self.right_press.take() else { continue };
+                    if self.popup.is_none() && from.distance(pos) <= RIGHT_CLICK_DIST {
+                        self.open(Popup::Box { node, screen: pos, programs: false });
+                    }
+                }
+                Event::Key { key: Key::Escape, pressed: true, .. } | Event::WindowFocused(false) => self.close_popups(),
+                _ => {}
+            }
         }
 
         let mut pins: Vec<Pin> = Vec::new();
@@ -357,46 +506,6 @@ impl Field {
                 if x.clicked() {
                     act.push(Action::Delete(nid));
                 }
-                let n: &Node = n;
-                resp.context_menu(|ui| {
-                    if ui.button("Open plugin editor").clicked() {
-                        act.push(Action::OpenEditor(nid));
-                        ui.close_menu();
-                    }
-                    if ui.button("Open mappings editor").clicked() {
-                        act.push(Action::OpenMappings(nid));
-                        ui.close_menu();
-                    }
-                    if let NodeKind::Plugin(pl) = &n.kind {
-                        let np = pl.num_programs();
-                        if np > 1 {
-                            ui.menu_button("Programs", |ui| {
-                                ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                                    for k in 0..np {
-                                        if ui.selectable_label(k == pl.program(), format!("{} - {}", k + 1, pl.program_name(k))).clicked() {
-                                            act.push(Action::SetProgram(nid, k));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            });
-                        }
-                        if ui.button("User presets...").clicked() {
-                            act.push(Action::UserPresets(nid));
-                            ui.close_menu();
-                        }
-                    }
-                    let mut by = n.bypassed();
-                    if ui.checkbox(&mut by, "Bypass").clicked() {
-                        act.push(Action::Bypass(nid));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Delete").clicked() {
-                        act.push(Action::Delete(nid));
-                        ui.close_menu();
-                    }
-                });
             }
         }
 
@@ -424,10 +533,11 @@ impl Field {
                 self.wire = None;
                 if let Some(t) = target {
                     let (s, d) = if w.out { (w, t) } else { (t, w) };
-                    let (Some(sn), Some(dn)) = (g.node(s.node), g.node(d.node)) else { return act };
-                    let (sc, dc) = (sn.out_channel(s.pin), dn.in_channel(d.pin));
-                    if g.connect(s.node, sc, d.node, dc) {
-                        act.push(Action::Connected(s.node, d.node, w.param));
+                    let chans = g.node(s.node).zip(g.node(d.node)).map(|(sn, dn)| (sn.out_channel(s.pin), dn.in_channel(d.pin)));
+                    if let Some((sc, dc)) = chans {
+                        if g.connect(s.node, sc, d.node, dc) {
+                            act.push(Action::Connected(s.node, d.node, w.param));
+                        }
                     }
                 }
             }
@@ -440,11 +550,6 @@ impl Field {
                 Some(cn) if ctrl => self.selected.push(cn),
                 Some(cn) => self.selected = vec![cn],
                 None => self.selected.clear(),
-            }
-        }
-        if bg.double_clicked() && hovered_cable.is_none() {
-            if let Some(m) = bg.interact_pointer_pos() {
-                self.add_menu = Some((m, (m - origin).to_pos2(), true));
             }
         }
         self.selected.retain(|s| g.conns.contains(s));
@@ -463,55 +568,214 @@ impl Field {
         scrollbar(ui, hbar, false, &mut self.scroll.x, vp.width(), vp.width() + max.x, id.with("hs"));
         ui.painter().rect_filled(Rect::from_min_max(vp.max, field.max), CornerRadius::ZERO, c.get(colours::WINDOW_BG));
 
-        self.add_menu_ui(ui, plugins, &mut act);
+        self.popups_ui(ui.ctx(), g, plugins, &mut act);
         act
     }
 
-    fn add_menu_ui(&mut self, ui: &mut Ui, plugins: &[PluginInfo], act: &mut Vec<Action>) {
-        let Some((screen, at, fresh)) = self.add_menu else { return };
-        let mut close = false;
-        let area = Area::new(Id::new("add_menu")).order(Order::Foreground).fixed_pos(screen).show(ui.ctx(), |ui| {
+    /// Draws the open menu and acts on its choices; a choice, or its box going away, closes it.
+    fn popups_ui(&mut self, ctx: &Context, g: &Graph, plugins: &[PluginInfo], act: &mut Vec<Action>) {
+        let (chosen, popup, rects) = match self.popup {
+            None => return,
+            Some(Popup::Add { screen, at }) => {
+                let (chosen, r) = add_menu(ctx, screen, at, plugins, act);
+                (chosen, Popup::Add { screen, at }, vec![r])
+            }
+            Some(Popup::Box { node, screen, programs }) => {
+                let Some(n) = g.node(node) else { return self.close_popups() };
+                let (chosen, programs, rects) = box_menu(ctx, n, screen, programs, self.popup_rects.get(1).copied(), act);
+                (chosen, Popup::Box { node, screen, programs }, rects)
+            }
+        };
+        if chosen {
+            self.close_popups();
+        } else {
+            self.popup = Some(popup);
+            self.popup_rects = rects;
+        }
+    }
+}
+
+/// One entry of the add panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AddItem {
+    Builtin(Kind),
+    Plugin(usize),
+}
+
+/// The add panel's entries with their names: the built-ins and every known plugin in one flat
+/// list sorted by name (createTree 0x140101400 sorting alphabetically, addToMenu 0x140101280).
+/// Equal names keep the plugin list's order, which starts with the built-ins: the saved list
+/// loads (0x140100ec0, at 0x140034302) before the built-ins are added (0x140034439..0x140034514).
+fn add_items(plugins: &[PluginInfo]) -> Vec<(AddItem, &str)> {
+    let builtins = Kind::ALL.into_iter().map(|k| (AddItem::Builtin(k), k.name()));
+    let plugins = plugins.iter().enumerate().map(|(i, p)| (AddItem::Plugin(i), p.name.as_str()));
+    let mut items: Vec<(AddItem, &str)> = builtins.chain(plugins).collect();
+    items.sort_by(|a, b| name_key(a.1).cmp(name_key(b.1)));
+    items
+}
+
+/// JUCE's compareLexicographically (0x140120080): leading characters that are neither letters
+/// nor digits are skipped, then the rest compares byte by byte with A-Z lowered (_stricmp), so
+/// "_" sorts before the letters.
+fn name_key(s: &str) -> impl Iterator<Item = u8> + '_ {
+    s.trim_start_matches(|c: char| !c.is_alphanumeric()).bytes().map(|b| b.to_ascii_lowercase())
+}
+
+/// The add panel (PluginField mouseDown 0x140078fc0): every item by its plain name, VST3 plugins
+/// marked as such. Returns whether something was chosen, and the panel's rectangle.
+fn add_menu(ctx: &Context, screen: Pos2, at: Pos2, plugins: &[PluginInfo], act: &mut Vec<Action>) -> (bool, Rect) {
+    let mut chosen = false;
+    let area = Area::new(Id::new(ADD_MENU)).order(Order::Foreground).fixed_pos(screen).show(ctx, |ui| {
+        Frame::menu(ui.style()).show(ui, |ui| {
+            ui.style_mut().visuals.button_frame = false;
+            ui.set_min_width(190.0);
+            ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                for (item, name) in add_items(plugins) {
+                    let pick = match item {
+                        AddItem::Builtin(k) => ui.button(name).on_hover_text(k.description()).clicked().then_some(Action::AddBuiltin(k, at)),
+                        AddItem::Plugin(i) => {
+                            let p = &plugins[i];
+                            let label = if p.format == "VST3" { format!("{name} (VST3)") } else { name.to_owned() };
+                            ui.button(label).on_hover_text(&p.manufacturer).clicked().then_some(Action::AddPlugin(i, at))
+                        }
+                    };
+                    if let Some(a) = pick {
+                        act.push(a);
+                        chosen = true;
+                    }
+                }
+                if plugins.is_empty() {
+                    ui.separator();
+                    ui.weak("No plugins yet: Options > Plugin List");
+                }
+            });
+        });
+    });
+    (chosen, area.response.rect)
+}
+
+/// A processor's menu, drawn like egui's context menus, with the Programs list opening beside it.
+/// `last_list` is where the list was last drawn. Returns whether something was chosen, whether
+/// the list stays open, and the rectangles drawn (the menu, then the list).
+fn box_menu(ctx: &Context, n: &Node, screen: Pos2, mut programs: bool, last_list: Option<Rect>, act: &mut Vec<Action>) -> (bool, bool, Vec<Rect>) {
+    let nid = n.id;
+    let plugin = if let NodeKind::Plugin(pl) = &n.kind { Some(pl) } else { None };
+    let mut chosen = false;
+    let mut row = None;
+    let menu = Area::new(Id::new(BOX_MENU))
+        .order(Order::Foreground)
+        .fixed_pos(screen)
+        .default_width(ctx.style().spacing.menu_width)
+        .sense(Sense::hover())
+        .show(ctx, |ui| {
+            menu_style(ui.style_mut());
             Frame::menu(ui.style()).show(ui, |ui| {
-                ui.style_mut().visuals.button_frame = false;
-                ui.set_min_width(190.0);
-                ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
-                    ui.label(RichText::new("Built-in").strong());
-                    for k in Kind::ALL {
-                        if ui.button(k.name()).on_hover_text(k.description()).clicked() {
-                            act.push(Action::AddBuiltin(k, at));
-                            close = true;
+                ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+                    let mut pick = None;
+                    if ui.button("Open plugin editor").clicked() {
+                        pick = Some(Action::OpenEditor(nid));
+                    }
+                    if ui.button("Open mappings editor").clicked() {
+                        pick = Some(Action::OpenMappings(nid));
+                    }
+                    if let Some(pl) = plugin {
+                        if pl.num_programs() > 1 {
+                            row = Some(submenu_row(ui, "Programs", programs));
+                        }
+                        if ui.button("User presets...").clicked() {
+                            pick = Some(Action::UserPresets(nid));
                         }
                     }
-                    let mut cats: Vec<String> = plugins.iter().map(|p| p.menu_category()).collect();
-                    cats.sort_by_key(|c| c.to_lowercase());
-                    cats.dedup();
-                    for cat in cats {
-                        ui.separator();
-                        ui.label(RichText::new(&cat).strong());
-                        let mut list: Vec<(usize, &PluginInfo)> = plugins.iter().enumerate().filter(|(_, p)| p.menu_category() == cat).collect();
-                        list.sort_by_key(|(_, p)| p.name.to_lowercase());
-                        for (i, p) in list {
-                            let label = if p.format == "VST3" { format!("{} (VST3)", p.name) } else { p.name.clone() };
-                            if ui.button(label).on_hover_text(&p.manufacturer).clicked() {
-                                act.push(Action::AddPlugin(i, at));
-                                close = true;
-                            }
-                        }
+                    let mut bypassed = n.bypassed();
+                    if ui.checkbox(&mut bypassed, "Bypass").clicked() {
+                        pick = Some(Action::Bypass(nid));
                     }
-                    if plugins.is_empty() {
-                        ui.separator();
-                        ui.weak("No plugins yet: Options > Plugin List");
+                    ui.separator();
+                    if ui.button("Delete").clicked() {
+                        pick = Some(Action::Delete(nid));
+                    }
+                    if let Some(a) = pick {
+                        act.push(a);
+                        chosen = true;
                     }
                 });
             });
         });
-        let outside = ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|m| !area.response.rect.contains(m)));
-        if close || (outside && !fresh) || ui.input(|i| i.key_pressed(Key::Escape)) {
-            self.add_menu = None;
-        } else {
-            self.add_menu = Some((screen, at, false));
-        }
+    let mut rects = vec![menu.response.rect];
+    let (Some(row), Some(pl)) = (row, plugin) else { return (chosen, false, rects) };
+
+    // egui's submenu rule: the list opens when its row is hovered and closes when another row of
+    // the menu is, unless the pointer is on its way to the list.
+    let pointer = ctx.input(|i| i.pointer.clone());
+    let m = pointer.hover_pos();
+    let toward_list = !pointer.is_still() && last_list.zip(m).is_some_and(|(r, m)| r.intersects_ray(m, pointer.direction().normalized()));
+    let on_list = last_list.zip(m).is_some_and(|(r, m)| r.contains(m));
+    if toward_list {
+        ctx.request_repaint();
+    } else if row.hovered() || row.clicked() {
+        programs = true;
+    } else if programs && menu.response.contains_pointer() && !on_list {
+        programs = false;
     }
+    if programs && !chosen {
+        let style = ctx.style();
+        let at = pos2(menu.response.rect.right() + style.spacing.menu_spacing, row.rect.top() - Frame::menu(&style).total_margin().top);
+        let list = Area::new(Id::new(PROGRAMS_LIST))
+            .order(Order::Foreground)
+            .fixed_pos(at)
+            .default_width(style.spacing.menu_width)
+            .sense(Sense::hover())
+            .show(ctx, |ui| {
+                menu_style(ui.style_mut());
+                Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+                        ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                            for k in 0..pl.num_programs() {
+                                if ui.selectable_label(k == pl.program(), format!("{} - {}", k + 1, pl.program_name(k))).clicked() {
+                                    act.push(Action::SetProgram(nid, k));
+                                    chosen = true;
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+        rects.push(list.response.rect);
+    }
+    (chosen, programs, rects)
+}
+
+/// egui's menu look (menu.rs set_menu_style): tight rows without outlines.
+fn menu_style(style: &mut Style) {
+    style.spacing.button_padding = vec2(2.0, 0.0);
+    style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+}
+
+/// A menu row that opens a list beside the menu, like egui's submenu button: the label on the
+/// left, an arrow on the right, and the "open" look while the list shows.
+fn submenu_row(ui: &mut Ui, text: &str, open: bool) -> Response {
+    let pad = ui.spacing().button_padding;
+    let width = ui.available_width() - 2.0 * pad.x;
+    let label = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Wrap), width, TextStyle::Button);
+    let arrow = WidgetText::from("\u{23F5}").into_galley(ui, Some(TextWrapMode::Wrap), width - label.size().x, TextStyle::Button);
+    let mut size = vec2(label.size().x + ui.spacing().item_spacing.x + arrow.size().x, label.size().y.max(arrow.size().y)) + 2.0 * pad;
+    size.y = size.y.max(ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_at_least(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = if open && !resp.hovered() { ui.style().visuals.widgets.open } else { *ui.style().interact(&resp) };
+        if ui.visuals().button_frame {
+            ui.painter().rect_filled(rect.expand(v.expansion), v.corner_radius, v.weak_bg_fill);
+        }
+        let inner = rect.shrink2(pad);
+        let label_at = Align2::LEFT_CENTER.align_size_within_rect(label.size(), inner).min;
+        let arrow_at = Align2::RIGHT_CENTER.align_size_within_rect(arrow.size(), inner).min;
+        ui.painter().galley(label_at, label, v.text_color());
+        ui.painter().galley(arrow_at, arrow, v.text_color());
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -532,8 +796,7 @@ mod tests {
         fn new() -> Rig {
             let ctx = Context::default();
             crate::setup_fonts(&ctx);
-            let gc = GraphCtx { sample_rate: 44100.0, block: 256, dev_ins: 2, dev_outs: 2, window: vec2(1024.0, 580.0), audio_in: true, midi_in: true, osc_in: true };
-            let mut rig = Rig { ctx, field: Field::default(), g: Graph::new_default(&gc), t: 0.0, field_r: Rect::NOTHING };
+            let mut rig = Rig { ctx, field: Field::default(), g: Graph::new_default(&gctx()), t: 0.0, field_r: Rect::NOTHING };
             rig.frame(vec![]);
             rig
         }
@@ -568,6 +831,30 @@ mod tests {
         fn key(&mut self, key: Key) -> Vec<Action> {
             self.frame(vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }])
         }
+        /// A point given in field coordinates.
+        fn at(&self, x: f32, y: f32) -> Pos2 {
+            self.field_r.min + vec2(x, y)
+        }
+        fn button(&mut self, at: Pos2, button: PointerButton, pressed: bool) -> Vec<Action> {
+            self.frame(vec![Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE }])
+        }
+        /// Move, press, release: one frame each, so the press comes 50 ms after the call starts.
+        fn click(&mut self, at: Pos2, button: PointerButton) -> Vec<Action> {
+            let mut acts = self.frame(vec![Event::PointerMoved(at)]);
+            acts.extend(self.button(at, button, true));
+            acts.extend(self.button(at, button, false));
+            acts
+        }
+        fn add_panel(&self) -> Option<Pos2> {
+            match self.field.popup {
+                Some(Popup::Add { screen, .. }) => Some(screen),
+                _ => None,
+            }
+        }
+    }
+
+    fn gctx() -> GraphCtx {
+        GraphCtx { sample_rate: 44100.0, block: 256, dev_ins: 2, dev_outs: 2, window: vec2(1024.0, 580.0), audio_in: true, midi_in: true, osc_in: true }
     }
 
     fn renamed(acts: &[Action]) -> bool {
@@ -613,6 +900,206 @@ mod tests {
         }
         assert_eq!(rig.field.selected, vec![rig.g.conns[0]]);
         assert_eq!(rig.g.node(midi).map(|n| n.pos), Some(pos2(400.0, 0.0)), "the box under the cable stays put");
+    }
+
+    #[test]
+    fn right_click_reopens_the_add_panel_after_every_way_of_closing_it() {
+        use PointerButton::{Primary, Secondary};
+        let mut rig = Rig::new();
+        let (p, q) = (rig.at(500.0, 300.0), rig.at(200.0, 100.0));
+        rig.click(p, Secondary);
+        assert_eq!(rig.add_panel(), Some(p));
+
+        rig.key(Key::Escape);
+        assert_eq!(rig.add_panel(), None);
+        rig.t += 1.0;
+        rig.click(p, Secondary);
+        assert_eq!(rig.add_panel(), Some(p), "after Escape");
+
+        rig.t += 1.0;
+        rig.click(q, Primary);
+        assert_eq!(rig.add_panel(), None);
+        rig.t += 1.0;
+        rig.click(p, Secondary);
+        assert_eq!(rig.add_panel(), Some(p), "after a click outside it");
+
+        rig.frame(vec![Event::WindowFocused(false)]);
+        assert_eq!(rig.add_panel(), None);
+        rig.frame(vec![Event::WindowFocused(true)]);
+        rig.t += 1.0;
+        rig.click(p, Secondary);
+        assert_eq!(rig.add_panel(), Some(p), "after the window lost focus");
+
+        // A right-click outside the open panel moves it there.
+        rig.t += 1.0;
+        rig.click(q, Secondary);
+        assert_eq!(rig.add_panel(), Some(q));
+
+        // Choosing from it: click down the panel until a click adds a processor.
+        let panel = rig.field.popup_rects[0];
+        let mut pick = pos2(panel.left() + 30.0, panel.top() + 2.0);
+        let mut added = false;
+        while !added && pick.y < panel.bottom() {
+            rig.t += 1.0;
+            added = rig.click(pick, Primary).iter().any(|a| matches!(a, Action::AddBuiltin(..)));
+            if !added {
+                pick.y += 5.0;
+            }
+        }
+        assert!(added, "no click in the panel added a processor");
+        assert_eq!(rig.add_panel(), None);
+        // Right-clicking that same spot in the very next frame, while egui still lists the closed
+        // panel as shown there.
+        rig.button(pick, Secondary, true);
+        rig.button(pick, Secondary, false);
+        assert_eq!(rig.add_panel(), Some(pick), "right after choosing from it");
+    }
+
+    #[test]
+    fn a_double_click_opens_the_add_panel_with_the_originals_timing() {
+        use PointerButton::Primary;
+        let mut rig = Rig::new();
+        let p = rig.at(500.0, 300.0);
+        // Presses 350 ms apart: a double-click to the original (400 ms), though not to egui (300 ms).
+        rig.t += 1.0;
+        rig.click(p, Primary);
+        assert_eq!(rig.add_panel(), None);
+        rig.t += 0.25;
+        rig.button(p, Primary, true);
+        assert_eq!(rig.add_panel(), Some(p), "opens on the second press");
+        rig.button(p, Primary, false);
+        assert_eq!(rig.add_panel(), Some(p));
+        rig.key(Key::Escape);
+
+        rig.t += 1.0;
+        rig.click(p, Primary);
+        rig.t += 0.35;
+        rig.button(p, Primary, true);
+        rig.button(p, Primary, false);
+        assert_eq!(rig.add_panel(), None, "presses 450 ms apart");
+
+        rig.t += 1.0;
+        rig.click(p, Primary);
+        rig.click(p + vec2(8.0, 0.0), Primary);
+        assert_eq!(rig.add_panel(), None, "presses 8 px apart");
+        rig.t += 1.0;
+        rig.click(p, Primary);
+        rig.click(p + vec2(7.5, 0.0), Primary);
+        assert_eq!(rig.add_panel(), Some(p + vec2(7.5, 0.0)), "presses 7.5 px apart, under 8");
+        assert!(matches!(rig.field.popup, Some(Popup::Add { at, .. }) if at == pos2(507.0, 300.0)), "the new box goes at whole field pixels");
+        rig.key(Key::Escape);
+        rig.t += 1.0;
+        rig.click(p, Primary);
+        rig.click(p + vec2(0.0, 7.0), Primary);
+        assert_eq!(rig.add_panel(), Some(p + vec2(0.0, 7.0)), "presses 7 px apart");
+
+        // A double-click straight after the click that closed the panel (egui counts a triple).
+        let (q, r) = (rig.at(200.0, 100.0), rig.at(300.0, 150.0));
+        rig.click(q, Primary);
+        assert_eq!(rig.add_panel(), None);
+        rig.click(r, Primary);
+        rig.click(r, Primary);
+        assert_eq!(rig.add_panel(), Some(r));
+        // A quick third press beside the panel makes a count of 3: it closes the panel and, as in
+        // the original, doesn't open it again.
+        rig.click(r - vec2(3.0, 3.0), Primary);
+        assert_eq!(rig.add_panel(), None, "a third press");
+    }
+
+    #[test]
+    fn the_add_panel_lists_everything_in_one_list_sorted_like_the_original() {
+        let plug = |name: &str, format: &str| PluginInfo { name: name.into(), format: format.into(), ..Default::default() };
+        let plugins = [plug("pro-Q 3", "VST3"), plug("~Tape", "VST"), plug("Looper", "VST"), plug("Zebra", "VST"), plug("DelayZ", "VST"), plug("Delay_", "VST")];
+        let items = add_items(&plugins);
+        let names: Vec<&str> = items.iter().map(|(_, n)| *n).collect();
+        // Built-ins mix in by name, case is ignored, leading symbols are skipped ("~Tape" files
+        // under T) and "_" sorts before the letters.
+        let want = ["Audio Recorder", "Delay_", "DelayZ", "File Player", "Level", "Looper", "Looper", "Metronome", "Output Toggle", "pro-Q 3", "~Tape", "VU Meter", "Zebra"];
+        assert_eq!(names, want);
+        let loopers: Vec<AddItem> = items.iter().filter(|(_, n)| *n == "Looper").map(|(i, _)| *i).collect();
+        assert_eq!(loopers, [AddItem::Builtin(Kind::Looper), AddItem::Plugin(2)], "equal names keep the built-in first");
+    }
+
+    #[test]
+    fn a_processors_menu_closes_with_its_box_and_right_click_keeps_working() {
+        use PointerButton::Secondary;
+        let mut rig = Rig::new();
+        let id = rig.g.add_builtin(Kind::Level, pos2(300.0, 300.0), &gctx());
+        rig.frame(vec![]);
+        let on_box = rig.at(320.0, 312.0);
+        rig.t += 1.0;
+        rig.click(on_box, Secondary);
+        assert_eq!(rig.field.popup, Some(Popup::Box { node: id, screen: on_box, programs: false }));
+        let menu = rig.field.popup_rects[0];
+
+        // Input and output boxes have no menu: a right-click there only closes this one.
+        rig.t += 1.0;
+        rig.click(rig.at(30.0, 30.0), Secondary);
+        assert_eq!(rig.field.popup, None);
+
+        // The box goes away while its menu shows: the menu goes with it, and a right-click where
+        // the menu was opens the add panel.
+        rig.t += 1.0;
+        rig.click(on_box, Secondary);
+        assert!(matches!(rig.field.popup, Some(Popup::Box { .. })));
+        rig.g.remove(id);
+        rig.frame(vec![]);
+        assert_eq!(rig.field.popup, None);
+        rig.t += 1.0;
+        rig.click(menu.center(), Secondary);
+        assert_eq!(rig.add_panel(), Some(menu.center()));
+    }
+
+    #[test]
+    fn the_add_panel_opens_on_the_right_press_and_a_right_drag_moves_a_box_without_its_menu() {
+        use PointerButton::Secondary;
+        let mut rig = Rig::new();
+        let p = rig.at(500.0, 300.0);
+        rig.frame(vec![Event::PointerMoved(p)]);
+        rig.button(p, Secondary, true);
+        assert_eq!(rig.add_panel(), Some(p), "opens on the press");
+        // The hand slips before the button comes up: the panel stays where it opened.
+        let slip = p + vec2(12.0, 9.0);
+        rig.frame(vec![Event::PointerMoved(slip)]);
+        rig.button(slip, Secondary, false);
+        assert_eq!(rig.add_panel(), Some(p));
+        rig.key(Key::Escape);
+
+        let id = rig.g.add_builtin(Kind::Level, pos2(300.0, 300.0), &gctx());
+        let on_box = rig.at(320.0, 312.0);
+        rig.t += 1.0;
+        rig.frame(vec![Event::PointerMoved(on_box)]);
+        rig.button(on_box, Secondary, true);
+        for k in 1..=4 {
+            rig.frame(vec![Event::PointerMoved(on_box + vec2(10.0 * k as f32, 0.0))]);
+        }
+        rig.button(on_box + vec2(40.0, 0.0), Secondary, false);
+        assert_eq!(rig.field.popup, None, "a right-drag moves the box instead");
+        assert!(rig.g.node(id).is_some_and(|n| n.pos.x > 300.0));
+    }
+
+    #[test]
+    fn menus_keep_working_after_a_button_release_is_lost() {
+        use PointerButton::{Primary, Secondary};
+        let mut rig = Rig::new();
+        let id = rig.g.add_builtin(Kind::Level, pos2(300.0, 300.0), &gctx());
+        let (p, on_box) = (rig.at(500.0, 300.0), rig.at(320.0, 312.0));
+        // A left press whose release happens outside the window, so egui never hears of it.
+        rig.frame(vec![Event::PointerMoved(p)]);
+        rig.button(p, Primary, true);
+        rig.frame(vec![Event::PointerGone]);
+        rig.t += 1.0;
+        rig.click(on_box, Secondary);
+        assert!(matches!(rig.field.popup, Some(Popup::Box { node, .. }) if node == id));
+        // egui's own context menu closed as soon as the box was hovered, the left button looking held.
+        for dx in [-6.0, -10.0, -14.0] {
+            rig.frame(vec![Event::PointerMoved(on_box + vec2(dx, 0.0))]);
+        }
+        assert!(matches!(rig.field.popup, Some(Popup::Box { .. })));
+        rig.key(Key::Escape);
+        rig.t += 1.0;
+        rig.click(p, Secondary);
+        assert_eq!(rig.add_panel(), Some(p));
     }
 
     #[test]

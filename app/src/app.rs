@@ -398,6 +398,7 @@ impl App {
         let ctx = self.ctx();
         let p = &self.patches[self.current];
         let tempo = p.tempo;
+        let stored = p.el.is_some();
         let (g, errs) = match &p.el {
             Some(el) => Graph::from_patch_el(el, &ctx),
             None => (Graph::new_default(&ctx), Vec::new()),
@@ -410,6 +411,11 @@ impl App {
         }
         self.field.selected.clear();
         self.field.stop_rename();
+        self.field.close_popups();
+        // switchPatch (0x140039720) clears the field's hint after loading a stored patch.
+        if stored {
+            self.field.hide_hint();
+        }
         self.dlg.mappings = None;
         self.dlg.editors.clear();
         self.dlg.raise = None;
@@ -687,14 +693,19 @@ impl App {
                 Action::AddBuiltin(k, pos) => {
                     let ctx = self.ctx();
                     self.graph.add_builtin(k, pos, &ctx);
+                    self.field.hide_hint();
                     changed = true;
                 }
                 Action::AddPlugin(i, pos) => {
                     let Some(info) = self.settings.plugins.get(i).cloned() else { continue };
                     let ctx = self.ctx();
                     match self.graph.add_plugin(&info, pos, &ctx) {
-                        Ok(_) => changed = true,
-                        Err(e) => self.message("Plugin error", &format!("Could not load {}:\n{e}", info.name)),
+                        Ok(_) => {
+                            self.field.hide_hint();
+                            changed = true;
+                        }
+                        // addFilter (0x14002c6b0) titles its failure message this way.
+                        Err(e) => self.message("Couldn't create filter", &format!("Could not load {}:\n{e}", info.name)),
                     }
                 }
                 Action::Connected(_, dst, param) => {
