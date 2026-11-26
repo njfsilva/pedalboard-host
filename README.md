@@ -22,6 +22,7 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 - [Features](#features)
 - [Getting started](#getting-started)
 - [Usage](#usage)
+- [Patch and preset management](#patch-and-preset-management)
 - [Built-in processors](#built-in-processors)
 - [Project layout](#project-layout)
 - [Design notes](#design-notes)
@@ -43,7 +44,8 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
   - Program Change messages can switch patches.
   - MMC messages can control the transport.
 - 📡 **OSC input** over UDP (default port `5678`), with optional multicast.
-- 🗂️ **Patches**: several patches per `.pdl` file, next/previous switching, and an optional wrap-around from the last patch to the first.
+- 🗂️ **Patches**: several patches per `.pdl` file, next/previous switching, and an optional wrap-around from the last patch to the first. Organise patches in bulk, and import or export patches from the organiser.
+- 🎚️ **Presets**: per-plugin preset bars, `.fxp` import/export, and a manager for copying, renaming, importing and removing presets. Built-in processors can save and load presets too.
 - ⏱️ **Main transport**: tempo, tap tempo, play/pause and return to zero.
 - 🎨 **Colour schemes**: compatible with Pedalboard2's `.colourscheme` files.
 - 🧰 **Application mappings**: trigger Next/Previous Patch, Play/Pause, Return to Zero and Tap Tempo from MIDI or OSC.
@@ -99,6 +101,16 @@ pedalhost.exe [file.pdl] [--screenshot out.png]
 
 Settings are stored in `%APPDATA%\PedalboardHost\settings.json`, and the default patch is `default.pdl` in the same folder.
 
+## Patch and preset management
+
+Use **Edit → Organise patches** to rename, copy, remove or reorder patches. The organiser also imports patches from another `.pdl` file and exports selected patches to a separate `.pdl` file. The currently playing patch stays selected when patches are reordered; importing a patch adds it to the open set without switching away from the current patch.
+
+Open a processor's editor to use its **Presets** bar. Choose a plugin program or a saved preset from the list, type a name and use **Save** to store the current sound. **Import** loads an `.fxp` file into the current processor; it does not add that file to the saved-preset list.
+
+Use **Edit → User Preset Management** (or **User presets...** from a processor's context menu) to manage saved presets. Select a preset to rename, copy, remove, import an `.fxp` file into that plugin's library, or export it to a file. Presets are shared with the original Pedalboard2 and are stored under `%APPDATA%\Pedalboard2\presets\`, in a folder for each plugin. Built-in processor presets use the same manager.
+
+See the [patch and preset guide](docs/patches-and-presets.md) for the workflows and file locations in more detail. The [mechanics notes](app/MECHANICS.md) document implementation details and compatibility behavior.
+
 ## Built-in processors
 
 | Processor | I/O | Description |
@@ -132,6 +144,7 @@ app/
     ├── plugins/          # VST2 (vst2.rs), VST3 (vst3/), plugin editor windows
     ├── midi.rs, osc.rs   # MIDI and OSC input
     ├── pdl.rs            # .pdl patch file reading and writing
+    ├── presets.rs        # per-processor preset bars and .fxp preset files
     ├── colours.rs        # colour schemes and JUCE-style colour maths
     ├── settings.rs       # settings stored as JSON
     ├── tempo.rs          # tap tempo
