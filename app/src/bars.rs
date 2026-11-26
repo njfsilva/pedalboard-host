@@ -59,9 +59,14 @@ pub type Row = (String, String, bool, bool);
 /// A popup list in the original's style. `above` is where to put it if it doesn't fit below.
 /// Returns the chosen row and the popup's rectangle.
 pub fn popup_list(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row], c: &Scheme) -> (Option<usize>, Rect) {
+    popup_list_min(ui, id, at, above, rows, c, 140.0)
+}
+
+/// A popup list at least `min_w` wide.
+pub fn popup_list_min(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row], c: &Scheme, min_w: f32) -> (Option<usize>, Rect) {
     let lw = rows.iter().map(|r| text_w(ui, &r.0, font(BAR_FONT))).fold(0.0f32, f32::max);
     let sw = rows.iter().map(|r| text_w(ui, &r.1, font(13.0))).fold(0.0f32, f32::max);
-    let w = (lw + sw + 56.0).max(140.0);
+    let w = (lw + sw + 56.0).max(min_w);
     let h: f32 = rows.iter().map(|r| if r.0.is_empty() { 8.0 } else { 22.0 }).sum::<f32>() + 4.0;
     let screen = ui.ctx().screen_rect();
     let mut pos = at;
@@ -111,7 +116,7 @@ pub fn popup_list(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row], c
     (chosen, area.response.rect)
 }
 
-fn pressed_outside(ui: &Ui, keep: &[Rect]) -> bool {
+pub(crate) fn pressed_outside(ui: &Ui, keep: &[Rect]) -> bool {
     ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|m| !keep.iter().any(|r| r.contains(m))))
 }
 

@@ -72,6 +72,16 @@ pub trait PluginUi {
     fn program_name(&self, i: i32) -> String;
     fn get_state(&mut self) -> Vec<u8>;
     fn set_state(&mut self, data: &[u8]) -> bool;
+    /// The current program as an .fxp file's contents (JUCE's getCurrentProgramStateInformation).
+    fn program_state(&mut self) -> Vec<u8> {
+        self.get_state()
+    }
+    /// Renames a program; plugins that can't rename programs ignore it.
+    fn rename_program(&mut self, _i: i32, _name: &str) {}
+    /// The native window the plugin's editor is open in.
+    fn editor_window(&self) -> Option<&editor::EditorWindow> {
+        None
+    }
     fn has_editor(&self) -> bool;
     fn open_editor(&mut self, owner: isize, on_top: bool, fixed_size: bool) -> Result<(), String>;
     fn editor_open(&self) -> bool;

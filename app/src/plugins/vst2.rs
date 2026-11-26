@@ -1,7 +1,8 @@
 //! VST 2.4 hosting over the plugin's plain C interface (no SDK headers needed).
 
-use super::editor::{client_size, fit_view, is_shown, plugin_view, resize_client, set_view_size, window_size, EditorWindow};
+use super::editor::{client_size, fit_view, is_shown, plugin_view, resize_for_plugin, set_view_size, window_size, EditorWindow};
 use super::{c_text, Loaded, PluginInfo, PluginUi};
+use crate::presets::BAR_W;
 use crate::engine::{in_audio_thread, ProcessArgs, Processor, MIDI_CAP};
 use crate::watchdog::{self, Stage};
 use std::cell::{Cell, UnsafeCell};
@@ -239,7 +240,7 @@ unsafe extern "C" fn host_callback(effect: *mut AEffect, opcode: i32, index: i32
             if let Some(h) = host {
                 let hwnd = h.editor.load(Relaxed);
                 if hwnd != 0 && index > 0 && value > 0 {
-                    resize_client(hwnd, index, value as i32);
+                    resize_for_plugin(hwnd, index, value as i32);
                     return 1;
                 }
             }
@@ -679,13 +680,14 @@ fn view_size(actual: (i32, i32), reported: Option<(i32, i32)>) -> ((i32, i32), b
 }
 
 /// The original's size check: when the plugin has changed the size of its own window, the
-/// editor window follows. `stuck` holds a size Windows wouldn't give the window, so it isn't
-/// asked for again on every check. Returns true when it resized the window.
-fn follow_view_size(hwnd: isize, stuck: &mut Option<(i32, i32)>) -> bool {
+/// editor window follows. `host` is the area under the presets bar the plugin's window is in,
+/// never narrower than the bar. `stuck` holds a size Windows wouldn't give the window, so it
+/// isn't asked for again on every check. Returns true when it resized the window.
+fn follow_view_size(hwnd: isize, host: isize, stuck: &mut Option<(i32, i32)>) -> bool {
     if !is_shown(hwnd) {
         return false;
     }
-    let view = plugin_view(hwnd);
+    let view = plugin_view(host);
     if view == 0 {
         return false;
     }
@@ -693,15 +695,16 @@ fn follow_view_size(hwnd: isize, stuck: &mut Option<(i32, i32)>) -> bool {
     if size.0 <= 0 || size.1 <= 0 {
         return false;
     }
-    if size == client_size(hwnd) {
+    let expected = (size.0.max(BAR_W), size.1);
+    if client_size(host) == expected {
         *stuck = None;
         return false;
     }
     if *stuck == Some(size) {
         return false;
     }
-    resize_client(hwnd, size.0, size.1);
-    if client_size(hwnd) != size {
+    resize_for_plugin(hwnd, size.0, size.1);
+    if client_size(host) != expected {
         *stuck = Some(size);
     }
     true
@@ -813,15 +816,14 @@ impl PluginUi for V2Ui {
         self.inst.set_program(i);
     }
 
+    /// The plugin's own name for a program, blank when it gives none, as JUCE's VST host has it:
+    /// the original's presets list shows a blank name as " " (fill 0x1400879d0).
     fn program_name(&self, i: i32) -> String {
         let mut buf = [0u8; 512];
         let ok = self.inst.call(EFF_GET_PROGRAM_NAME_INDEXED, i, -1, buf.as_mut_ptr() as *mut c_void, 0.0) != 0;
-        let mut n = if ok { c_text(&buf) } else { String::new() };
+        let n = if ok { c_text(&buf) } else { String::new() };
         if n.is_empty() && i == self.inst.program() {
-            n = self.inst.text(EFF_GET_PROGRAM_NAME, 0);
-        }
-        if n.is_empty() {
-            format!("Program {}", i + 1)
+            self.inst.text(EFF_GET_PROGRAM_NAME, 0)
         } else {
             n
         }
@@ -939,6 +941,40 @@ impl PluginUi for V2Ui {
         }
     }
 
+    /// One program as JUCE's VST host saves it: an 'FPCh' program chunk for plugins that use
+    /// chunks, otherwise an 'FxCk' list of the program's parameters.
+    fn program_state(&mut self) -> Vec<u8> {
+        let fx = self.inst.fx();
+        if fx.flags & FLAG_PROGRAM_CHUNKS == 0 {
+            let mut v = Vec::new();
+            self.program_block(&mut v);
+            return v;
+        }
+        let mut ptr: *mut c_void = null_mut();
+        let size = self.inst.call(EFF_GET_CHUNK, 1, 0, &mut ptr as *mut *mut c_void as *mut c_void, 0.0);
+        let chunk: &[u8] = if size > 0 && !ptr.is_null() { unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) } } else { &[] };
+        let name = self.inst.text(EFF_GET_PROGRAM_NAME, 0);
+        crate::presets::fpch(&name, fx.unique_id, fx.version, fx.num_programs.max(0), chunk)
+    }
+
+    /// As JUCE's changeProgramName: only the current program, at most 24 bytes.
+    fn rename_program(&mut self, i: i32, name: &str) {
+        if self.num_programs() <= 0 || i != self.inst.program() || name == self.inst.text(EFF_GET_PROGRAM_NAME, 0) {
+            return;
+        }
+        let mut k = name.len().min(24);
+        while !name.is_char_boundary(k) {
+            k -= 1;
+        }
+        let mut buf = name.as_bytes()[..k].to_vec();
+        buf.push(0);
+        self.inst.call(EFF_SET_PROGRAM_NAME, 0, 0, buf.as_mut_ptr() as *mut c_void, 0.0);
+    }
+
+    fn editor_window(&self) -> Option<&EditorWindow> {
+        self.editor.as_ref()
+    }
+
     fn has_editor(&self) -> bool {
         self.inst.fx().flags & FLAG_HAS_EDITOR != 0
     }
@@ -955,12 +991,14 @@ impl PluginUi for V2Ui {
         let resizable = !fixed_size && !self.never_resizable;
         let mut win = EditorWindow::new(&self.name, w, h, owner, on_top, resizable)?;
         let hwnd = win.hwnd as isize;
+        // The plugin's window goes in the area under the presets bar.
+        let host = win.host as isize;
         self.inst.host.editor.store(hwnd, Relaxed);
         // The original's order: open, ask for the size again, then ask for the program.
-        self.inst.call(EFF_EDIT_OPEN, 0, 0, win.hwnd as *mut c_void, 0.0);
+        self.inst.call(EFF_EDIT_OPEN, 0, 0, win.host as *mut c_void, 0.0);
         let reported = self.reported_rect();
         self.inst.call(EFF_GET_PROGRAM, 0, 0, null_mut(), 0.0);
-        let view = plugin_view(hwnd);
+        let view = plugin_view(host);
         // A plugin that won't take the size it reported keeps its own size from then on.
         let mut keep_size = false;
         let (w, h) = if view == 0 {
@@ -973,14 +1011,14 @@ impl PluginUi for V2Ui {
             }
             (w.max(EDITOR_MIN), h.max(EDITOR_MIN))
         };
-        // Whenever the window changes size, the plugin's window is laid over all of it.
+        // Whenever the window changes size, the plugin's window is laid over all of the area.
         win.set_on_size(Box::new(move |cw, ch| {
-            let view = plugin_view(hwnd);
+            let view = plugin_view(host);
             if view != 0 {
                 fit_view(view, cw, ch);
             }
         }));
-        resize_client(hwnd, w, h);
+        resize_for_plugin(hwnd, w, h);
         let inst = self.inst.clone();
         let mut countdown = 0;
         let mut stuck = None;
@@ -991,7 +1029,7 @@ impl PluginUi for V2Ui {
                 if countdown <= 0 {
                     countdown = SIZE_CHECK_TICKS;
                     // After a change, check again on the next tick.
-                    if !keep_size && follow_view_size(hwnd, &mut stuck) {
+                    if !keep_size && follow_view_size(hwnd, host, &mut stuck) {
                         countdown = 0;
                     }
                 }
@@ -1062,36 +1100,39 @@ mod tests {
 
     #[test]
     fn an_editor_window_and_the_plugins_window_keep_the_same_size() {
-        use super::super::editor::{client_size, fit_view, resize_client, set_view_size, wide, window_size, EditorWindow};
+        use super::super::editor::{client_size, fit_view, resize_for_plugin, set_view_size, wide, window_size, EditorWindow};
         use super::follow_view_size;
         use std::ptr::{null, null_mut};
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
         let mut win = EditorWindow::new("test", 300, 150, 0, false, false).unwrap();
-        let hwnd = win.hwnd as isize;
+        let (hwnd, host) = (win.hwnd as isize, win.host as isize);
         let class = wide("STATIC");
         unsafe {
             // Off screen and without taking focus.
             SetWindowPos(win.hwnd, null_mut(), -20000, -20000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             ShowWindow(win.hwnd, SW_SHOWNOACTIVATE);
-            let view = CreateWindowExW(0, class.as_ptr(), null(), WS_CHILD | WS_VISIBLE, 0, 0, 500, 300, win.hwnd, null_mut(), null_mut(), null());
+            // Never narrower than the presets bar, which sits above the plugin.
+            assert_eq!((client_size(hwnd), client_size(host)), ((396, 182), (396, 150)));
+            let view = CreateWindowExW(0, class.as_ptr(), null(), WS_CHILD | WS_VISIBLE, 0, 0, 500, 300, win.host, null_mut(), null_mut(), null());
             assert!(!view.is_null());
             let view = view as isize;
             // The window follows the plugin's own window.
             let mut stuck = None;
-            assert!(follow_view_size(hwnd, &mut stuck));
-            assert_eq!(client_size(hwnd), (500, 300));
-            assert!(!follow_view_size(hwnd, &mut stuck));
+            assert!(follow_view_size(hwnd, host, &mut stuck));
+            assert_eq!((client_size(hwnd), client_size(host)), ((500, 332), (500, 300)));
+            assert!(!follow_view_size(hwnd, host, &mut stuck));
             set_view_size(view, 700, 450);
-            assert!(follow_view_size(hwnd, &mut stuck));
-            assert_eq!(client_size(hwnd), (700, 450));
-            // A size Windows won't give a window with a title bar is asked for once, not on every check.
+            assert!(follow_view_size(hwnd, host, &mut stuck));
+            assert_eq!(client_size(host), (700, 450));
+            // A plugin narrower than the bar gets the bar's width, once.
             set_view_size(view, 4, 4);
-            assert!(follow_view_size(hwnd, &mut stuck));
-            assert!(!follow_view_size(hwnd, &mut stuck));
-            // The plugin's window is laid over the whole window when the window changes size.
+            assert!(follow_view_size(hwnd, host, &mut stuck));
+            assert!(!follow_view_size(hwnd, host, &mut stuck));
+            assert_eq!(client_size(host), (396, 4));
+            // The plugin's window is laid over the whole area when the window changes size.
             win.set_on_size(Box::new(move |cw, ch| fit_view(view, cw, ch)));
-            resize_client(hwnd, 640, 480);
+            resize_for_plugin(hwnd, 640, 480);
             assert_eq!(window_size(view), (640, 480));
         }
     }

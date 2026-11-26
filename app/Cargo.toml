@@ -45,6 +45,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # The audio path has to be fast even in a plain `cargo build`, so debug builds are optimised too.

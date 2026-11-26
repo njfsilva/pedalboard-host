@@ -55,7 +55,7 @@ pub struct Dialogs {
     pub organiser_opens: u32,
     /// The organiser's "Select patch..." box, open after Import... read a file.
     pub import: Option<crate::editors::ImportPick>,
-    pub presets: Option<crate::editors::PresetState>,
+    pub presets: Option<crate::editors::PresetManager>,
     pub mappings: Option<u32>,
     pub map_draft: crate::editors::MapDraft,
     pub log: bool,
@@ -241,10 +241,13 @@ fn commit_osc_text(s: &mut Settings, port: &mut String, group: &mut String) {
 
 impl App {
     pub fn windows(&mut self, ctx: &Context) {
-        // The organiser's "Select patch..." box goes first so its Enter and Escape reach it before
-        // any window under it reads them.
+        // The organiser's "Select patch..." box and the preset manager's prompts go first so their
+        // Enter and Escape reach them before any window under them reads them.
         if self.dlg.import.is_some() {
             self.import_window(ctx);
+        }
+        if self.dlg.presets.as_ref().is_some_and(|m| m.prompting()) {
+            self.preset_prompt(ctx);
         }
         self.editor_windows(ctx);
         self.message_window(ctx);
@@ -290,14 +293,25 @@ impl App {
         let c = self.scheme.clone();
         let fixed = self.settings.fixed_size_windows;
         let raise = self.dlg.raise.take();
+        let bar_h = crate::presets::BAR_H as f32;
         let mut keep = Vec::new();
+        let mut events = Vec::new();
         for nid in std::mem::take(&mut self.dlg.editors) {
             let Some(n) = self.graph.node_mut(nid) else { continue };
-            let size = match &n.kind {
+            let body = match &n.kind {
                 NodeKind::Builtin(b) => b.kind.editor_size(),
                 NodeKind::Plugin(p) => generic_editor_size(p.num_params()),
                 _ => continue,
             };
+            // As in the original (0x140076240), the editor sits under a presets bar and the
+            // window is at least as wide as the bar.
+            let size = vec2(body.x.max(crate::presets::BAR_W as f32), body.y + bar_h);
+            let slot = self.preset_bars.entry(nid).or_insert_with(|| {
+                let mut s = crate::presets::BarSlot::default();
+                s.bar.fill(n, &crate::presets::folder(&n.info));
+                s
+            });
+            slot.bar.follow(n);
             let wid = Id::new(("editor", nid));
             let mut open = true;
             Window::new(n.title().to_string())
@@ -306,10 +320,13 @@ impl App {
                 .collapsible(false)
                 .resizable(!fixed)
                 .default_size(size)
+                .min_size(vec2(crate::presets::BAR_W as f32, bar_h))
                 .frame(Frame::window(&ctx.style()).inner_margin(Margin::ZERO))
                 .show(ctx, |ui| {
-                    let want = if fixed { size } else { ui.available_size() };
+                    let want = if fixed { size } else { ui.available_size().max(vec2(crate::presets::BAR_W as f32, bar_h)) };
                     let (r, _) = ui.allocate_exact_size(want, Sense::hover());
+                    let (top, r) = r.split_top_bottom_at_y(r.top() + bar_h);
+                    events.extend(crate::presets::bar_ui(ui, top, wid.with("bar"), slot, &c).into_iter().map(|e| (nid, e)));
                     match &mut n.kind {
                         NodeKind::Builtin(b) => b.editor_ui(ui, r, wid.with("body"), &c),
                         NodeKind::Plugin(p) => generic_editor(ui, r, wid.with("body"), p.as_mut()),
@@ -324,6 +341,9 @@ impl App {
             }
         }
         self.dlg.editors = keep;
+        for (nid, e) in events {
+            self.bar_event(nid, e);
+        }
     }
 
     fn message_window(&mut self, ctx: &Context) {

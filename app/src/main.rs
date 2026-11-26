@@ -21,6 +21,7 @@ mod osc;
 mod pdl;
 mod plugin_list;
 mod plugins;
+mod presets;
 mod settings;
 mod tempo;
 mod tray;

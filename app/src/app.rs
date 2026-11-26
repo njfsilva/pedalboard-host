@@ -162,6 +162,8 @@ pub struct App {
     pub pc_notice: Option<(u8, f64)>,
     pub pending: Vec<Cmd>,
     pub dlg: Dialogs,
+    /// Each box's presets bar and what it kept of the programs presets were loaded over.
+    pub preset_bars: std::collections::HashMap<u32, crate::presets::BarSlot>,
     pub log: VecDeque<String>,
     pub tx: mpsc::Sender<Incoming>,
     rx: mpsc::Receiver<Incoming>,
@@ -252,6 +254,7 @@ impl App {
             pc_notice: None,
             pending: Vec::new(),
             dlg: Dialogs::default(),
+            preset_bars: Default::default(),
             log: VecDeque::new(),
             tx,
             rx,
@@ -271,6 +274,7 @@ impl App {
             tray_hide: 0,
             restarts: Restarts::default(),
         };
+        app.start_presets();
         if app.shot.is_none() {
             if let Err(e) = app.open_device() {
                 app.message("Audio Device Error", &e);
@@ -428,6 +432,8 @@ impl App {
         }
         self.dlg.mappings = None;
         self.dlg.editors.clear();
+        // The boxes are new, and with them their bars and what those kept.
+        self.preset_bars.clear();
         self.dlg.raise = None;
         self.rebuild();
         // The old processors stay alive inside the old plan until the audio thread lets go of it.
@@ -615,7 +621,7 @@ impl App {
                 }
                 self.dlg.organiser = true;
             }
-            Cmd::UserPresets => self.dlg.presets = Some(Default::default()),
+            Cmd::UserPresets => self.open_presets(),
             Cmd::MiscSettings => self.dlg.misc = true,
             Cmd::AudioSettings => self.dlg.open_audio(&self.settings, &self.engine),
             Cmd::PluginList => self.dlg.plugins = Some(Default::default()),
@@ -670,24 +676,30 @@ impl App {
     pub fn open_editor(&mut self, id: u32) {
         let (owner, top, fixed) = (self.hwnd, self.settings.windows_on_top, self.settings.fixed_size_windows);
         let Some(n) = self.graph.node_mut(id) else { return };
+        // A window that wasn't open gets its presets bar filled afresh.
+        let mut fresh = false;
         // A plugin's own editor opens in a window of its own; built-ins and plugins without one
         // get theirs in a window inside this one (the generic editor for plugins).
         let r = match &mut n.kind {
             NodeKind::Plugin(p) if p.has_editor() => {
                 let _stage = watchdog::enter(Stage::PluginEditor);
+                fresh = !p.editor_open();
                 p.open_editor(owner, top, fixed)
             }
             NodeKind::Builtin(_) | NodeKind::Plugin(_) => {
                 if !self.dlg.editors.contains(&id) {
                     self.dlg.editors.push(id);
+                    fresh = true;
                 }
                 self.dlg.raise = Some(id);
                 Ok(())
             }
             _ => Ok(()),
         };
-        if let Err(e) = r {
-            self.message("Plugin editor", &e);
+        match r {
+            Ok(()) if fresh => self.open_bar(id),
+            Ok(()) => {}
+            Err(e) => self.message("Plugin editor", &e),
         }
     }
 
@@ -736,6 +748,7 @@ impl App {
                         self.rebuild();
                         self.dirty = true;
                         self.dlg.editors.retain(|e| *e != id);
+                        self.preset_bars.remove(&id);
                         if self.dlg.mappings == Some(id) {
                             self.dlg.mappings = None;
                         }
@@ -747,8 +760,9 @@ impl App {
                         p.set_program(k);
                         self.dirty = true;
                     }
+                    self.sync_bar(id);
                 }
-                Action::UserPresets(id) => self.dlg.presets = Some(crate::editors::PresetState::for_node(id)),
+                Action::UserPresets(_) => self.open_presets(),
             }
         }
         if changed {
@@ -897,6 +911,7 @@ impl eframe::App for App {
         }
         if self.style_for.as_ref() != Some(&self.scheme) {
             crate::dialogs::apply_style(ctx, &self.scheme);
+            crate::plugins::editor::set_bar_look(crate::presets::look(&self.scheme));
             self.style_for = Some(self.scheme.clone());
         }
         while let Ok(m) = self.rx.try_recv() {
@@ -907,6 +922,8 @@ impl eframe::App for App {
         }
         self.engine.collect_garbage();
         self.check_device(ctx);
+        // Before the plugins' idle, which may close a window whose bar still has typing to pass on.
+        self.bar_events();
         let sr = self.engine.sample_rate();
         let mut errors = Vec::new();
         {

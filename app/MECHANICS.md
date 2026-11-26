@@ -495,6 +495,81 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
   - **Safety:** it refuses to write over the open patch file, which would lose that file's other patches.
   - **No side effects:** it doesn't change the open file, its changed flag or the recent file.
 
+## User presets (PresetBar 0x1400865f0, UserPresetWindow 0x14008a320)
+
+- **Where they live:** `<application data>\Pedalboard2\presets\<plugin>\<name>.fxp` (root 0x1400887b0, "presets" 0x140418240), one folder per plugin, named as the plugin list names the plugin (for an old VST2 plugin, its file name without the extension). The original uses that name as it is (getChildFile 0x140112600, under the user's application data, special location 3 at 0x140133b70); the rebuild replaces characters a folder name can't have (**rebuild's own**). The rebuild uses the same folder, so both programs see the same presets.
+- **Listing** (0x140088480): every "*.fxp" file (0x140418264) in the plugin's folder, named without the extension. The rebuild sorts the names ignoring case, then by case.
+
+### The "Presets:" bar (constructor 0x1400865f0, resized 0x140087310, paint 0x140087250)
+
+- **Size:** 396 × 32 along the top of every plugin window. The window around the plugin (EditorWrapper 0x140076240) is the editor's size plus 32 in height, and never narrower than 396.
+- **Parts** (x, y, w, h, from resized 0x140087310; made in the constructor 0x1400865f0):
+  - label "Presets:" (0x140417fa8, named "presetsLabel") at (0, 4, 64, 24), its text at (5, 5, 54, 22): font 15 (0x14043394c), black (0xFF000000 at 0x1404b3520) on no background, centred on the left, not editable;
+  - combo box "presetsComboBox" (0x140417f88) at (64, 4, 272, 24), its text editable and centred on the left (justification 0x21); with an empty list it says "(no choices)" (0x140284010);
+  - Import button (340, 4, 24, 24), a folder icon (openButton.svg), tooltip "Import preset from .fxp file" (0x140418008);
+  - Save button (368, 4, 24, 24), a disk icon (newButton.svg), tooltip "Save current preset" (0x140417fe0);
+  - both are DrawableButtons showing their icon on a button (style 3) in the scheme's "Button Colour".
+- **Look** (paint 0x140087250): filled 0xEEECE1, then a 1 px stroke (1.0 at 0x14042ee48) of 0x20000000 along y 32 (0x14043a9c8). The stroke's upper half falls on row 31 and comes out 0xDFDDD3 over the fill, which is the colour and row the rebuild draws. The paint also fills a path with no area in 0x2AA545, which draws nothing.
+- **The list** (fill 0x1400879d0): the plugin's programs, then its presets, numbered from 1. A program without a name is listed as " " (0x1404180a4), because JUCE's combo box leaves empty items out. When the window opens, item getCurrentProgram() + 1 is ticked without sending a change, and its name is in the box.
+- **Program names** are the plugin's own (VST2: effGetProgramNameIndexed, and effGetProgramName for the current one, trimmed). The rebuild makes none up; it used to show "Program N", a text the original doesn't have. The box's Programs menu shows an unnamed program as its number alone (**rebuild's own**; the menu is the rebuild's).
+- **Picking** (comboBoxChanged 0x140087470):
+  - a program is chosen, and when a preset went over it before, the state kept for it is put back and forgotten;
+  - a preset is read whole from the plugin's folder, its name given the extension "fxp" (0x140088010, 0x140418250), and handed to the plugin as the current program's state (0x140087e50; JUCE's VST host reads the first block in it);
+  - before a preset goes over a program, the program's state is kept on the box (PluginComponent+0x1e0, filled by 0x140073ba0), but only when the item picked before was a program (lastId − 1 < number of programs, so also when nothing was picked yet), and only for the first preset over it (std::map::insert 0x1400776e0 keeps the first). A preset picked after a preset keeps nothing, even when that preset moved the plugin to another program;
+  - picking the ticked item again, with its own text in the box, does nothing (JUCE's combo box sends no change);
+  - typing in the box (an item number below 0) renames the current program, and the typed name is the one Save uses.
+- **Save** (buttonClicked 0x1400876e0, then 0x1400881a0): makes the presets folder (0x140087c30) and the plugin's folder when they're missing, then writes the current program's state (getCurrentProgramStateInformation) to the box's text with the extension ".fxp" (0x140418258, through File::withFileExtension 0x140113e60) in the plugin's folder. Then it fills the list again and ticks the item that was ticked (getSelectedId 0x1401fe830, setSelectedId 0x1401fe970), so the box shows that item's name as the plugin now gives it, or nothing when no item was ticked.
+- **Import** (buttonClicked 0x1400876e0): the file chooser "Select an .fxp file to import..." (0x140418060) with "*.fxp" (0x140418048), starting nowhere in particular (File::nonexistent); the chosen file is read whole and loads over the current program (0x140087e50) without being added to the list, and the presets folder is made when it's missing (0x140087c30). The box then shows the current program's name (ComboBox::setText 0x1401fec80): the item with that text is ticked, or none. The last picked item and what's kept for Picking stay as they were.
+- **The file** is what JUCE's VST host writes for one program: an 'FPCh' chunk for plugins that keep their state in a chunk, otherwise an 'FxCk' list of the program's parameters.
+- **Differences in the rebuild:**
+  - VST3 plugins (the original has none) keep their whole state in an 'FPCh' file, with the first 8 hex digits of the class id as the plugin id (**rebuild's own**).
+  - A preset saved by a different plugin (another id in the file) is refused with "This preset was saved by a different plugin." (**rebuild's own** message).
+  - Save checks the name first: an empty name, a reserved one (CON, NUL, COM1…) or one with \ / : * ? " < > | is refused (**rebuild's own**). The original checks nothing (0x1400881a0): an empty box saves `<plugin>.fxp` beside the plugin's folder, where no list finds it.
+  - The original cuts a name at its last dot before adding ".fxp" (File::withFileExtension 0x140113e60): "v1.2" is saved as "v1.fxp", and a preset whose file name has a dot in it, copied in from elsewhere, can't be loaded from the bar. The rebuild keeps the whole name (a bug, fixed).
+  - The original adds to the end of a file that's already there (FileOutputStream 0x140133440: CreateFileW with OPEN_ALWAYS, then SetFilePointer to the end), so saving over a preset leaves the old one first in the file, and that's what loads. The rebuild writes the file afresh (a bug, fixed).
+  - After Save the rebuild keeps the same preset ticked by its name. The original keeps the item's number, so when the new preset sorts before the ticked one, the tick moves to its neighbour.
+  - After Import the rebuild reads the current program's name again and ticks that program. The original ticks the last item with that name, which is a preset when one has the program's name, and when the file renamed the program its item keeps the old name, so nothing is ticked. With no programs the rebuild empties the box and ticks nothing, as the original does when the plugin gives its current program no name.
+  - Typing: the original renames the current program even to an empty text, and puts the text on the item picked last, even a preset's. The rebuild ignores an empty text and changes only the program's item (**rebuild's own**).
+  - With no programs, the original ticks the first preset without loading it when the window opens, so picking it then does nothing. The rebuild ticks nothing (a quirk, not copied).
+  - Presets earlier versions of the rebuild kept in their own folder move into the shared folder as .fxp files when the app starts (never in screenshot mode) (**rebuild's own**).
+  - The bar follows a program chosen anywhere else (a mapping, MIDI, the box's Programs menu or the plugin's own window), so such a program counts as the item picked before when a preset goes over it.
+  - The built-in processors' windows get the bar too, saving their settings as JUCE binary XML (**rebuild's own**).
+
+### User Preset Management (constructor 0x14008a320, resized 0x14008b360, paint 0x14008b2e0, buttonClicked 0x14008b450)
+
+- **Opening:** Edit > User Preset Management (0x140410d10) or the box menu's "User presets...". It is 400 × 300 (0x1400385df–0x140038601) and goes through the same dialog helper as the organiser (0x140030940, called at 0x14003866b): centred on the screen, resizable (0x14021d340), only a close button (4), Escape closes it (flag 1 at 0x140038658), and it blocks the main window until it's closed (runModalLoop 0x1401acc50). The original builds a new window each time; the rebuild brings an open one to the front.
+- **Look** (paint 0x14008b2e0): the whole window 0xEEECE1, whatever the colour scheme, and a 0x40000000 shade 1 px larger than the tree all round.
+- **The tree** "presetList" (0x1404185c0) at (8, 8, w − 106, h − 15):
+  - its root is hidden (RootItem 0x140089fd0); under it, a folder per plugin (PluginItem 0x140089bc0, its presets listed with "*.fxp" when it opens 0x140089ce0, painted bold 0x140089e60) and its presets (PresetItem 0x140089870, painted plain and 4 px in, 0x140089980);
+  - rows are 20 high (0x14001bc50), each level 24 px further in, names 16 px (0x14042ef7c);
+  - the open/close box is 11 px (0x1401e6110), filled 0xE5FFFFFF with a 0x80000000 outline; the lines are 0x4C000000 (0x1404245c0, paint 0x140215a20);
+  - a press on the box, or a double-click on a folder's name, opens or closes it (mouseDown 0x140212370, double-click 0x140215a70).
+- **Buttons:** 82 × 24 at x w − 90, at y 8, 40, 72, 104 and 136 (resized 0x14008b360), always on:
+
+| Button | Tooltip | String |
+|---|---|---|
+| Rename | Rename the selected preset | 0x140418750 |
+| Copy | Duplicate the selected preset | 0x1404185d8 |
+| Remove | Delete the selected preset | 0x140418618 |
+| Import... | Import a preset from an .fxp file | 0x140418650 |
+| Export... | Export the selected preset to an .fxp file | 0x1404186c0 |
+
+- **What they do** (buttonClicked 0x14008b450). All but Import do nothing unless a preset is selected (a dynamic_cast to PresetItem).
+  - **Copy** (0x14008b4ce): the box "Copy Preset" (0x1404187f0) asks "Enter a name for the duplicate preset:" (0x1404187a0) in an empty text box "presetName" (0x140418808), with Cancel (result 0, no key) and Ok (result 1, Return). Ok copies the file to `<text>.fxp` (0x140418258) in the same folder.
+  - **Rename** (0x14008c926): the box "Rename Preset" (0x140418ae8) asks "Enter a new name for the selected preset:" (0x140418a90) the same way. Ok moves the file to `<text>` with the extension "fxp" (withFileExtension, 0x140418250; moveFileTo).
+  - **Remove** (0x14008b8ec): deletes the file at once, without asking. When that fails: a warning "Preset Deletion Error" (0x1404188c0), "Could not delete preset from the filesystem. Check your permissions." (0x140418830). Then the plugin's folder is deleted when nothing is left in it (wildcard "*", 0x1404185b8).
+  - **Import...:** the box "Import Preset" (0x140418958) asks "Select which plugin this preset is intended for:" (0x1404188f0) in a list "plugins" (0x140418978) with the first picked. After Ok, the file chooser "Import preset" (0x140418988, "*.fxp", flags 5 to open) and the file is copied into the plugin's folder. When the folder can't be made: a warning "Preset Import Error" (0x140418a40), "Could not create a directory for this plugin. Check your permissions." (0x1404189b0).
+  - **Export...:** the file chooser "Export preset" (0x140418a68, "*.fxp", flags 0x86 to save and ask before writing over a file); the name gets the extension "fxp" and the preset is copied there.
+  - After each, the tree is read again.
+- **Differences in the rebuild:**
+  - Copy, Rename and Import refuse to write over a preset with the same name ("A preset with that name already exists.") and check the name as Save does; the original writes over it (**rebuild's own**).
+  - Import always copies the file. The original copies it only when the plugin's folder didn't exist yet, so importing a second preset for a plugin did nothing there (a bug, fixed).
+  - Import's list holds the preset folder names of every plugin in the plugin list and of the built-in processors, sorted and without repeats; the original lists the plugin list's names in its own order (**estimated**).
+  - Export adds ".fxp" to a name typed with another extension instead of replacing it, and suggests `<preset>.fxp`. If a file already has the name with ".fxp" added, Export leaves it alone and says so, because the chooser only asked about the name as typed.
+  - After a change the tree keeps which folders are closed and what's selected (**estimated**); there's no keyboard control of the tree (**estimated**).
+  - The window can't get smaller than 200 × 168, keeping Export... in view (**estimated**; the original has no limit). Like the rebuild's organiser, it doesn't block the main window and Escape doesn't close it, so Escape keeps working on the board.
+  - Escape: neither prompt button has it, so it does nothing (**estimated**: the original's AlertWindow key handling wasn't read).
+
 ## Misc settings window (constructor 0x140081dc0, buttonClicked 0x140085980)
 
 - **Size:** 560 × 530 (setSize at 0x140085077); the window isn't resizable.

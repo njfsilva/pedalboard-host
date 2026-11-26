@@ -732,7 +732,10 @@ fn box_menu(ctx: &Context, n: &Node, screen: Pos2, mut programs: bool, last_list
                     ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
                         ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                             for k in 0..pl.num_programs() {
-                                if ui.selectable_label(k == pl.program(), format!("{} - {}", k + 1, pl.program_name(k))).clicked() {
+                                // An unnamed program shows only its number.
+                                let name = pl.program_name(k);
+                                let label = if name.is_empty() { (k + 1).to_string() } else { format!("{} - {}", k + 1, name) };
+                                if ui.selectable_label(k == pl.program(), label).clicked() {
                                     act.push(Action::SetProgram(nid, k));
                                     chosen = true;
                                 }

@@ -3,7 +3,7 @@
 //! preallocated parameter and event lists used inside the audio callback.
 
 use super::com::*;
-use crate::plugins::editor::resize_client;
+use crate::plugins::editor::resize_for_plugin;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr::{null, null_mut};
@@ -360,7 +360,7 @@ unsafe extern "system" fn frame_resize(this: *mut c_void, view: *mut c_void, r: 
     let hwnd = f.hwnd.load(Relaxed);
     if hwnd != 0 {
         f.resizing.store(true, Relaxed);
-        resize_client(hwnd, rect.width(), rect.height());
+        resize_for_plugin(hwnd, rect.width(), rect.height());
         f.resizing.store(false, Relaxed);
     }
     // Some plugins only update their layout from onSize, so the host always follows up with it.

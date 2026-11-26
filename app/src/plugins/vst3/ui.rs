@@ -3,7 +3,7 @@
 use super::com::*;
 use super::host::{new_frame, Frame, MemStream, Shared};
 use super::{read_params, Instance, Param};
-use crate::plugins::editor::{resize_client, EditorWindow};
+use crate::plugins::editor::{resize_for_plugin, EditorWindow};
 use crate::plugins::PluginUi;
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -171,6 +171,10 @@ impl PluginUi for V3Ui {
         self.controller().is_some()
     }
 
+    fn editor_window(&self) -> Option<&EditorWindow> {
+        self.win.as_ref()
+    }
+
     fn open_editor(&mut self, owner: isize, on_top: bool, fixed_size: bool) -> Result<(), String> {
         if let Some(w) = &self.win {
             w.show();
@@ -190,7 +194,8 @@ impl PluginUi for V3Ui {
             let frame = &*self.frame;
             frame.hwnd.store(win.hwnd as isize, Relaxed);
             (view.vt().set_frame)(view.ptr(), self.frame as *mut c_void);
-            if (view.vt().attached)(view.ptr(), win.hwnd as *mut c_void, c"HWND".as_ptr()) != OK {
+            // The plugin's window goes in the area under the presets bar.
+            if (view.vt().attached)(view.ptr(), win.host as *mut c_void, c"HWND".as_ptr()) != OK {
                 (view.vt().set_frame)(view.ptr(), null_mut());
                 frame.hwnd.store(0, Relaxed);
                 return Err("This plugin's editor failed to open.".into());
@@ -198,7 +203,7 @@ impl PluginUi for V3Ui {
             // Plugins often settle on their real size only once attached.
             let mut now = ViewRect::default();
             if (view.vt().get_size)(view.ptr(), &mut now) == OK && now.width() > 0 && now.height() > 0 && (now.width(), now.height()) != (w, h) {
-                resize_client(win.hwnd as isize, now.width(), now.height());
+                resize_for_plugin(win.hwnd as isize, now.width(), now.height());
             }
             if resizable {
                 let v = view.clone();

@@ -1,16 +1,19 @@
 //! The mappings editor (MIDI controllers and OSC addresses per box), the Patch Organiser and
-//! user presets.
+//! the User Preset Management window.
 
 use crate::app::{App, Cmd, Patch, UNTITLED};
 use crate::bars::baseline;
+use crate::builtins::Kind;
 use crate::colours;
 use crate::engine::{MidiMap, OscMap};
 use crate::pdl::El;
-use crate::settings;
-use crate::widgets::{bevel, bold, font, gradient_rrect, scrollbar, text_at, text_fit};
+use crate::plugins::PluginInfo;
+use crate::presets;
+use crate::widgets::{bevel, bold, font, gradient_rrect, rgb, scrollbar, text_at, text_fit};
 use egui::*;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Default)]
 pub struct MapDraft {
@@ -20,44 +23,11 @@ pub struct MapDraft {
     params: Vec<(i32, String)>,
 }
 
-#[derive(Default)]
-pub struct PresetState {
-    pub node: Option<u32>,
-    pub folder: Option<String>,
-    pub name: String,
-    pub selected: Option<String>,
-    pub rename: String,
-}
-
-impl PresetState {
-    pub fn for_node(id: u32) -> PresetState {
-        PresetState { node: Some(id), ..Default::default() }
-    }
-}
-
-fn presets_dir() -> PathBuf {
-    settings::dir().join("presets")
-}
-
 /// A name made safe for a file or folder.
-fn safe(s: &str) -> String {
+pub(crate) fn safe(s: &str) -> String {
     let t: String = s.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
     let t = t.trim().trim_end_matches('.').to_string();
     if t.is_empty() { "_".into() } else { t }
-}
-
-fn list_dir(dir: &Path, folders: bool) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir() == folders && (folders || p.extension().is_some_and(|x| x == "preset")))
-                .filter_map(|p| if folders { p.file_name() } else { p.file_stem() }.map(|s| s.to_string_lossy().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort_by_key(|s| s.to_lowercase());
-    v
 }
 
 fn param_combo(ui: &mut Ui, id: impl std::hash::Hash, v: &mut i32, params: &[(i32, String)]) -> bool {
@@ -126,6 +96,9 @@ const EDIT_OUTLINE: f32 = 2.0;
 const EDIT_BEVEL: u32 = 4;
 const EDIT_SHADOW: [u8; 4] = [0, 0, 0, 0x38];
 const EDIT_SHADOW_FADE: f32 = 0.75;
+/// Without the keyboard a text box has a 1 px outline in its outline colour and a 3 px inner
+/// shadow at full strength (the same drawTextEditorOutline).
+const EDIT_BEVEL_IDLE: u32 = 3;
 
 /// The file choosers' titles and the box Import... opens (buttonClicked, 0x14005d870). Export...
 /// is the rebuild's own, so its title is too.
@@ -208,6 +181,19 @@ fn alert_layout(ctx: &Context, title: &str, message: &str, buttons: &[&str], par
             .collect();
         AlertLayout { size: vec2(w, h), lines, combo, buttons }
     })
+}
+
+/// The top margin that puts the text of egui's text box in `r` where a JUCE TextEditor has it:
+/// egui puts the text's top at the margin, and JUCE starts a `size` px line 5 px down.
+fn edit_top(ui: &Ui, r: Rect, size: f32) -> i8 {
+    let line = Rect::from_min_size(r.min + vec2(0.0, EDIT_TEXT_TOP), vec2(r.width(), size));
+    let asc = ui
+        .fonts(|f| f.layout_no_wrap("A".into(), font(size), Color32::BLACK))
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(0.0, |g| g.pos.y);
+    (baseline(line, size) - r.top() - asc).round().clamp(0.0, r.height()) as i8
 }
 
 /// Whether two paths name the same file.
@@ -389,16 +375,7 @@ fn organiser_list(ui: &mut Ui, list: Rect, patches: &[Patch], c: &colours::Schem
         // and the selected text at the default table's black (0x140424594, 0x140424574).
         tu.visuals_mut().selection.bg_fill = c.get(colours::BUTTON_HIGHLIGHT);
         tu.visuals_mut().text_cursor.stroke.color = Color32::BLACK;
-        // egui puts the text's top at the top margin, so take the margin that lands the baseline
-        // where the original's 15 px line, starting 5 px down, has it.
-        let line = Rect::from_min_size(r.min + vec2(0.0, EDIT_TEXT_TOP), vec2(r.width(), ROW_FONT));
-        let asc = ui
-            .fonts(|f| f.layout_no_wrap("A".into(), font(ROW_FONT), Color32::BLACK))
-            .rows
-            .first()
-            .and_then(|row| row.glyphs.first())
-            .map_or(0.0, |g| g.pos.y);
-        let top = (baseline(line, ROW_FONT) - r.top() - asc).round().clamp(0.0, ROW_H) as i8;
+        let top = edit_top(ui, r, ROW_FONT);
         let edit_id = id.with("rename");
         let out = TextEdit::singleline(buf)
             .id(edit_id)
@@ -464,6 +441,406 @@ pub fn export_document(patches: &[&Patch]) -> String {
     let mut root = El::new("Pedalboard2PatchFile");
     root.children.extend(patches.iter().map(|p| p.to_el()));
     root.to_document()
+}
+
+/// User Preset Management as the menu command opens it (0x1400385d9): 400 x 300 in the middle,
+/// and it can be resized.
+const PRESETS_TITLE: &str = "User Preset Management";
+const PRESETS_SIZE: Vec2 = vec2(400.0, 300.0);
+/// The smallest the rebuild lets it get, keeping Export... (bottom at 160) in view. The original
+/// has no limit (estimated).
+const PRESETS_MIN: Vec2 = vec2(200.0, 168.0);
+/// Its paint (0x14008b2e0): the whole window in 0xEEECE1, whatever the colour scheme, and a
+/// 0x40000000 shade 1 px larger than the tree all round.
+const PRESETS_BG: u32 = 0xEEECE1;
+const TREE_SHADE: [u8; 4] = [0, 0, 0, 0x40];
+/// The tree (resized 0x14008b360): JUCE's TreeView rows are 20 high (0x14001bc50) and each level
+/// is 24 px further in. Its root is hidden, so the plugin folders start 24 px in, with their
+/// open/close box in the 24 px before them, and their presets 48 px in.
+const TREE_ROW: f32 = 20.0;
+const TREE_INDENT: f32 = 24.0;
+/// Names are 16 px (0x14042ef7c): a folder's bold (PluginItem::paint 0x140089e60), a preset's plain
+/// and 4 px in (PresetItem::paint 0x140089980). The selected preset sits on a box 4 px narrower than
+/// its row with 4 px corners, shaded like a selected patch.
+const TREE_FONT: f32 = 16.0;
+const PRESET_TEXT_X: f32 = 4.0;
+const PRESET_SEL_GAP: f32 = 4.0;
+const PRESET_SEL_RADIUS: f32 = 4.0;
+/// The lines joining presets to their folder: 1 px lines on half-pixel positions in JUCE's
+/// default line colour 0x4C000000 (linesColourId 0x1000501, 0x1404245c0; paint 0x140215a20),
+/// which cover two pixels at half strength each.
+const TREE_LINE: [u8; 4] = [0, 0, 0, 0x26];
+/// The open/close box (0x1401e6110 via 0x140215980): 11 px, centred in the 24 x 20 before the
+/// folder, filled 0xE5FFFFFF with a 0x80000000 outline, a minus and, while closed, a plus.
+const TREE_BOX: f32 = 11.0;
+const TREE_BOX_FILL: [u8; 4] = [255, 255, 255, 0xE5];
+const TREE_BOX_MARK: [u8; 4] = [0, 0, 0, 0x80];
+
+#[derive(Clone, Copy)]
+enum PresetOp {
+    Rename,
+    Copy,
+    Remove,
+    Import,
+    Export,
+}
+
+/// The manager's buttons: 82 x 24, 90 px in from the right edge (resized 0x14008b360), always
+/// on, with the original's tooltips (constructor 0x14008a320).
+const PRESET_BUTTONS: [(f32, &str, &str, PresetOp); 5] = [
+    (8.0, "Rename", "Rename the selected preset", PresetOp::Rename),
+    (40.0, "Copy", "Duplicate the selected preset", PresetOp::Copy),
+    (72.0, "Remove", "Delete the selected preset", PresetOp::Remove),
+    (104.0, "Import...", "Import a preset from an .fxp file", PresetOp::Import),
+    (136.0, "Export...", "Export the selected preset to an .fxp file", PresetOp::Export),
+];
+
+/// The prompts' buttons, Cancel first, with Return on Ok and no key on Cancel (0x14008b450).
+const PROMPT_BUTTONS: [&str; 2] = ["Cancel", "Ok"];
+const IMPORT_PRESET_TITLE: &str = "Import preset";
+const EXPORT_PRESET_TITLE: &str = "Export preset";
+const DELETE_ERROR_TITLE: &str = "Preset Deletion Error";
+const DELETE_ERROR: &str = "Could not delete preset from the filesystem. Check your permissions.";
+const IMPORT_ERROR_TITLE: &str = "Preset Import Error";
+const IMPORT_ERROR: &str = "Could not create a directory for this plugin. Check your permissions.";
+/// The rebuild's own: the original writes over a preset of the same name.
+const PRESET_EXISTS: &str = "A preset with that name already exists.";
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PromptKind {
+    Copy,
+    Rename,
+    Import,
+}
+
+impl PromptKind {
+    /// The box's title and message (buttonClicked, 0x14008b450).
+    fn words(self) -> (&'static str, &'static str) {
+        match self {
+            PromptKind::Copy => ("Copy Preset", "Enter a name for the duplicate preset:"),
+            PromptKind::Rename => ("Rename Preset", "Enter a new name for the selected preset:"),
+            PromptKind::Import => ("Import Preset", "Select which plugin this preset is intended for:"),
+        }
+    }
+}
+
+/// An open prompt: the preset it's for as (folder, name), the name typed so far (empty at first,
+/// as in the original), the plugin folders Import offers and the one picked (the first at first),
+/// and whether it just opened.
+struct PresetPrompt {
+    kind: PromptKind,
+    target: Option<(String, String)>,
+    text: String,
+    choices: Vec<String>,
+    pick: usize,
+    fresh: bool,
+}
+
+impl PresetPrompt {
+    fn new(kind: PromptKind) -> PresetPrompt {
+        PresetPrompt { kind, target: None, text: String::new(), choices: Vec::new(), pick: 0, fresh: true }
+    }
+}
+
+/// User Preset Management's own state while it's open: the preset folder as plugin folders and
+/// their presets, the folders the person closed (all open at first, as each PluginItem opens itself,
+/// 0x140089bc0), the selected preset as (folder, name), the scroll and an open prompt.
+pub struct PresetManager {
+    tree: Vec<(String, Vec<String>)>,
+    listed: bool,
+    closed: BTreeSet<String>,
+    sel: Option<(String, String)>,
+    scroll: f32,
+    prompt: Option<PresetPrompt>,
+    /// Which opening this is, so each is a fresh window in the middle at the original's size.
+    opens: u32,
+}
+
+impl Default for PresetManager {
+    fn default() -> PresetManager {
+        static OPENS: AtomicU32 = AtomicU32::new(0);
+        PresetManager { tree: Vec::new(), listed: false, closed: BTreeSet::new(), sel: None, scroll: 0.0, prompt: None, opens: OPENS.fetch_add(1, Ordering::Relaxed) }
+    }
+}
+
+impl PresetManager {
+    /// The preset files changed: the tree is read again before it's drawn next.
+    pub fn refresh(&mut self) {
+        self.listed = false;
+    }
+
+    pub fn prompting(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    /// Reads the preset folder: each plugin folder and its .fxp files (RootItem 0x140089fd0,
+    /// PluginItem 0x140089bc0). What's gone stops being selected or closed.
+    fn relist(&mut self, root: &Path) {
+        self.tree = presets::folders(root)
+            .into_iter()
+            .map(|f| {
+                let names = presets::list(&root.join(&f));
+                (f, names)
+            })
+            .collect();
+        let tree = &self.tree;
+        if self.sel.as_ref().is_some_and(|(f, n)| !tree.iter().any(|(tf, l)| tf == f && l.contains(n))) {
+            self.sel = None;
+        }
+        self.closed.retain(|c| tree.iter().any(|(f, _)| f == c));
+        self.listed = true;
+    }
+}
+
+/// A row of the tree: a plugin folder, or a preset in one as (folder, preset).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TreeRow {
+    Folder(usize),
+    Preset(usize, usize),
+}
+
+/// The rows shown: every folder, followed by its presets while it's open.
+fn tree_rows(tree: &[(String, Vec<String>)], closed: &BTreeSet<String>) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for (i, (f, names)) in tree.iter().enumerate() {
+        rows.push(TreeRow::Folder(i));
+        if !closed.contains(f) {
+            rows.extend((0..names.len()).map(|k| TreeRow::Preset(i, k)));
+        }
+    }
+    rows
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TreeHit {
+    Select,
+    Toggle,
+    Nothing,
+}
+
+/// What a press `x` px from the tree's left edge does to a row (TreeView mouseDown, 0x140212370):
+/// on the item it selects it, in the 24 px before a folder it opens or closes it, and anywhere
+/// else it does nothing, as presets have no box.
+fn tree_hit(row: TreeRow, x: f32) -> TreeHit {
+    let item_x = match row {
+        TreeRow::Folder(_) => TREE_INDENT,
+        TreeRow::Preset(..) => 2.0 * TREE_INDENT,
+    };
+    if x >= item_x {
+        TreeHit::Select
+    } else if x >= item_x - TREE_INDENT && matches!(row, TreeRow::Folder(_)) {
+        TreeHit::Toggle
+    } else {
+        TreeHit::Nothing
+    }
+}
+
+/// The tree of plugin folders and their presets (paintRecursively 0x140215d40). A press picks a
+/// row or opens or closes a folder from its box, and a double-click on a folder's name opens or
+/// closes it too (itemDoubleClicked 0x140215a70). Picking a folder leaves no preset selected.
+fn preset_tree(ui: &mut Ui, view: Rect, root: &Path, c: &colours::Scheme, m: &mut PresetManager) {
+    let id = Id::new(("presetTree", m.opens));
+    let mut rows = tree_rows(&m.tree, &m.closed);
+    if ui.rect_contains_pointer(view) {
+        m.scroll -= ui.input(|i| i.smooth_scroll_delta.y);
+    }
+    let total = rows.len() as f32 * TREE_ROW;
+    let max_scroll = (total - view.height()).max(0.0);
+    m.scroll = m.scroll.clamp(0.0, max_scroll);
+    let rows_w = if max_scroll > 0.0 {
+        scrollbar(ui, Rect::from_min_max(pos2(view.right() - LIST_SB, view.top()), view.max), true, &mut m.scroll, view.height(), total, id.with("sb"));
+        m.scroll = m.scroll.clamp(0.0, max_scroll);
+        view.width() - LIST_SB
+    } else {
+        view.width()
+    };
+    let rows_r = Rect::from_min_size(view.min, vec2(rows_w, view.height()));
+    let clip = rows_r.intersect(ui.clip_rect());
+    // Dragging on the tree mustn't move the window.
+    let resp = ui.interact(rows_r, id.with("rows"), Sense::click_and_drag());
+    let row_under = |p: Pos2, scroll: f32, rows: &[TreeRow]| -> Option<TreeRow> {
+        let k = ((p.y - rows_r.top() + scroll) / TREE_ROW).floor();
+        if !clip.contains(p) || k < 0.0 {
+            return None;
+        }
+        rows.get(k as usize).copied()
+    };
+    let mut toggle = None;
+    if resp.hovered() && ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+            if let Some(row) = row_under(p, m.scroll, &rows) {
+                match tree_hit(row, p.x - rows_r.left()) {
+                    TreeHit::Select => {
+                        m.sel = match row {
+                            TreeRow::Preset(f, k) => Some((m.tree[f].0.clone(), m.tree[f].1[k].clone())),
+                            TreeRow::Folder(_) => None,
+                        }
+                    }
+                    TreeHit::Toggle => toggle = Some(row),
+                    TreeHit::Nothing => {}
+                }
+            }
+        }
+    }
+    if resp.double_clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            if let Some(row @ TreeRow::Folder(_)) = row_under(p, m.scroll, &rows) {
+                if tree_hit(row, p.x - rows_r.left()) == TreeHit::Select {
+                    toggle = Some(row);
+                }
+            }
+        }
+    }
+    if let Some(TreeRow::Folder(f)) = toggle {
+        let name = m.tree[f].0.clone();
+        if !m.closed.remove(&name) {
+            // Closing a folder drops its presets, and with them the selection (0x140089ce0).
+            if m.sel.as_ref().is_some_and(|(sf, _)| *sf == name) {
+                m.sel = None;
+            }
+            m.closed.insert(name);
+        }
+        // Opening a folder reads its presets again (itemOpennessChanged, 0x140089ce0).
+        m.relist(root);
+        rows = tree_rows(&m.tree, &m.closed);
+        let total = rows.len() as f32 * TREE_ROW;
+        m.scroll = m.scroll.clamp(0.0, (total - view.height()).max(0.0));
+        ui.ctx().request_repaint();
+    }
+    let p = ui.painter().with_clip_rect(clip);
+    let (ls, text) = (c.get(colours::LIST_SELECTED), c.get(colours::TEXT));
+    let (line, box_fill, mark) = (colours::draw(TREE_LINE), colours::draw(TREE_BOX_FILL), colours::draw(TREE_BOX_MARK));
+    let first = (m.scroll / TREE_ROW) as usize;
+    let last = (((m.scroll + rows_r.height()) / TREE_ROW).ceil() as usize).min(rows.len());
+    for (i, row) in rows.iter().enumerate().take(last).skip(first) {
+        let top = rows_r.top() + i as f32 * TREE_ROW - m.scroll;
+        let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(rows_r.left() + x, top + y), vec2(w, h));
+        match *row {
+            TreeRow::Folder(f) => {
+                let b = at(((TREE_INDENT - TREE_BOX) / 2.0).floor(), ((TREE_ROW - TREE_BOX) / 2.0).floor(), TREE_BOX, TREE_BOX);
+                p.rect_filled(b, CornerRadius::ZERO, box_fill);
+                p.rect_stroke(b, CornerRadius::ZERO, Stroke::new(1.0f32, mark), StrokeKind::Inside);
+                let (mid, bar) = ((TREE_BOX / 2.0).floor(), (TREE_BOX / 2.0).floor() + 1.0);
+                p.rect_filled(Rect::from_min_size(b.min + vec2((TREE_BOX - bar) / 2.0, mid), vec2(bar, 1.0)), CornerRadius::ZERO, mark);
+                if m.closed.contains(&m.tree[f].0) {
+                    p.rect_filled(Rect::from_min_size(b.min + vec2(mid, (TREE_BOX - bar) / 2.0), vec2(1.0, bar)), CornerRadius::ZERO, mark);
+                }
+                let item = at(TREE_INDENT, 0.0, rows_w - TREE_INDENT, TREE_ROW);
+                text_at(&p.with_clip_rect(item), item.left(), baseline(item, TREE_FONT), Align::Min, &m.tree[f].0, bold(TREE_FONT), text);
+            }
+            TreeRow::Preset(f, k) => {
+                // A line down from the folder (half way for its last preset) and one across.
+                let x = 1.5 * TREE_INDENT;
+                let down = if k + 1 == m.tree[f].1.len() { TREE_ROW / 2.0 } else { TREE_ROW };
+                p.rect_filled(at(x - 1.0, 0.0, 2.0, down), CornerRadius::ZERO, line);
+                p.rect_filled(at(x, TREE_ROW / 2.0 - 1.0, TREE_INDENT / 2.0, 2.0), CornerRadius::ZERO, line);
+                let item = at(2.0 * TREE_INDENT, 0.0, rows_w - 2.0 * TREE_INDENT, TREE_ROW);
+                let name = &m.tree[f].1[k];
+                if m.sel.as_ref().is_some_and(|(sf, sn)| *sf == m.tree[f].0 && sn == name) {
+                    let r = Rect::from_min_size(item.min, vec2(item.width() - PRESET_SEL_GAP, TREE_ROW));
+                    gradient_rrect(&p, r, PRESET_SEL_RADIUS, colours::brighter(ls, SELECTED_TOP), colours::darker(ls, SELECTED_BOTTOM));
+                }
+                text_at(&p.with_clip_rect(item), item.left() + PRESET_TEXT_X, baseline(item, TREE_FONT), Align::Min, name, font(TREE_FONT), text);
+            }
+        }
+    }
+}
+
+/// A prompt's text box ("presetName") as the original's look draws a TextEditor: white, 15 px black
+/// text, "Button Highlight" behind selected text (0x1400211e0) and everything selected when it
+/// gets the keyboard. With the keyboard it has a 2 px "Menu Selection" outline and a 4 px shadow at
+/// 0.75, without it a 1 px outline and a 3 px shadow (drawTextEditorOutline 0x1401e7b60). As the
+/// box's only text box it keeps the keyboard.
+fn name_box(ui: &mut Ui, r: Rect, text: &mut String, fresh: &mut bool, c: &colours::Scheme) {
+    let id = Id::new("presetName");
+    let p = ui.painter().with_clip_rect(r);
+    p.rect_filled(r, CornerRadius::ZERO, Color32::WHITE);
+    if *fresh {
+        text_edit::TextEditState::default().store(ui.ctx(), id);
+    }
+    let top = edit_top(ui, r, ALERT_FONT);
+    let out = ui
+        .scope_builder(UiBuilder::new().max_rect(r), |ui| {
+            ui.visuals_mut().selection.bg_fill = c.get(colours::BUTTON_HIGHLIGHT);
+            ui.visuals_mut().text_cursor.stroke.color = Color32::BLACK;
+            TextEdit::singleline(text)
+                .id(id)
+                .font(font(ALERT_FONT))
+                .text_color(Color32::BLACK)
+                .frame(false)
+                .margin(Margin { left: EDIT_TEXT_LEFT, right: EDIT_RIGHT, top, bottom: EDIT_BOTTOM })
+                .desired_width(f32::INFINITY)
+                .min_size(r.size())
+                .show(ui)
+        })
+        .inner;
+    if *fresh || (!out.response.has_focus() && !ui.input(|i| i.pointer.any_down())) {
+        out.response.request_focus();
+    }
+    *fresh = false;
+    if out.response.gained_focus() {
+        let mut state = out.state;
+        state.cursor.set_char_range(Some(text::CCursorRange::two(text::CCursor::new(0), text::CCursor::new(text.chars().count()))));
+        state.store(ui.ctx(), id);
+    }
+    let shadow = colours::draw(EDIT_SHADOW);
+    let tall = Rect::from_min_size(r.min, r.size() + vec2(0.0, 2.0));
+    if ui.memory(|m| m.has_focus(id)) {
+        p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(EDIT_OUTLINE, c.get(colours::MENU_SELECTION)), StrokeKind::Inside);
+        bevel(&p, tall, EDIT_BEVEL, shadow.gamma_multiply(EDIT_SHADOW_FADE));
+    } else {
+        p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0f32, colours::draw(LIST_OUTLINE)), StrokeKind::Inside);
+        bevel(&p, tall, EDIT_BEVEL_IDLE, shadow);
+    }
+}
+
+/// The plugins Import offers, each by the name of its preset folder (for a VST plugin its file
+/// name, as the original's plugin list names it), and the built-in processors, sorted once each.
+fn plugin_folders(plugins: &[PluginInfo]) -> Vec<String> {
+    let mut v: Vec<String> = plugins.iter().map(presets::folder_name).chain(Kind::ALL.into_iter().map(|k| safe(k.name()))).collect();
+    presets::sort_names(&mut v);
+    v.dedup_by(|a, b| a.to_uppercase() == b.to_uppercase());
+    v
+}
+
+/// Copy: the preset again under a new name in the same folder (0x14008b4ce).
+fn copy_preset(dir: &Path, from: &str, to: &str) -> Result<String, String> {
+    let to = presets::check_name(to)?;
+    let dest = presets::preset_path(dir, &to);
+    if dest.exists() {
+        return Err(PRESET_EXISTS.into());
+    }
+    std::fs::copy(presets::preset_path(dir, from), &dest).map_err(|e| format!("Could not copy the preset \"{from}\": {e}"))?;
+    Ok(to)
+}
+
+/// Rename: the preset's file takes the new name (0x14008c926); changing only its case works too.
+fn rename_preset(dir: &Path, from: &str, to: &str) -> Result<String, String> {
+    let to = presets::check_name(to)?;
+    if to == from {
+        return Ok(to);
+    }
+    let (src, dest) = (presets::preset_path(dir, from), presets::preset_path(dir, &to));
+    if dest.exists() && !same_file(&src, &dest) {
+        return Err(PRESET_EXISTS.into());
+    }
+    std::fs::rename(&src, &dest).map_err(|e| format!("Could not rename the preset \"{from}\": {e}"))?;
+    Ok(to)
+}
+
+/// Import: a copy of an .fxp file in a plugin's folder under the file's own name.
+fn import_preset(dir: &Path, file: &Path) -> Result<String, String> {
+    let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = presets::check_name(&stem)?;
+    let dest = presets::preset_path(dir, &name);
+    if same_file(file, &dest) {
+        return Ok(name);
+    }
+    if dest.exists() {
+        return Err(PRESET_EXISTS.into());
+    }
+    std::fs::copy(file, &dest).map_err(|e| format!("Could not import {}: {e}", file.display()))?;
+    Ok(name)
 }
 
 impl App {
@@ -795,123 +1172,235 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// User Preset Management from the menu or a mapping. The original builds a new window each
+    /// time (0x1400385d9); one that's still open here comes to the front instead.
+    pub fn open_presets(&mut self) {
+        match &self.dlg.presets {
+            Some(m) => self.egui_ctx.move_to_top(LayerId::new(Order::Middle, Id::new(("presets", m.opens)))),
+            None => self.dlg.presets = Some(PresetManager::default()),
+        }
+    }
+
+    /// User Preset Management as the original lays it out (constructor 0x14008a320, resized
+    /// 0x14008b360, paint 0x14008b2e0): the tree at (8, 8) filling all but the right 106 px and
+    /// the bottom 15, on its shade, and the buttons 90 px in from the right. The buttons act on
+    /// the selected preset.
     pub fn presets_window(&mut self, ctx: &Context) {
-        let Some(st) = self.dlg.presets.as_mut() else { return };
-        let node_name = st.node.and_then(|id| self.graph.node(id)).map(|n| n.name().to_string());
-        if node_name.is_none() {
-            st.node = None;
+        let Some(mut m) = self.dlg.presets.take() else { return };
+        let root = presets::root();
+        if !m.listed {
+            m.relist(&root);
         }
-        let own = node_name.as_deref().map(safe);
-        if st.folder.is_none() {
-            st.folder = own.clone();
-        }
-        let root = presets_dir();
-        let mut folders = list_dir(&root, true);
-        if let Some(o) = own.as_ref().filter(|o| !folders.contains(o)) {
-            folders.insert(0, o.clone());
-        }
-        let presets = st.folder.as_ref().map(|f| list_dir(&root.join(f), false)).unwrap_or_default();
-        let can_load = own.is_some() && st.folder == own;
-        let (mut open, mut save, mut load, mut delete, mut rename) = (true, false, None, None, None);
-        Window::new("User Presets").open(&mut open).default_width(440.0).collapsible(false).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Plugin:");
-                ComboBox::from_id_salt("preset_folder").selected_text(st.folder.clone().unwrap_or_else(|| "(choose a plugin)".into())).width(280.0).show_ui(ui, |ui| {
-                    for f in &folders {
-                        if ui.selectable_label(st.folder.as_deref() == Some(f.as_str()), f).clicked() {
-                            st.folder = Some(f.clone());
-                            st.selected = None;
-                        }
+        let (mut open, mut op) = (true, None);
+        let c = &self.scheme;
+        // Centred like the original; the window's frame and title add about 12 x 40.
+        let screen = ctx.screen_rect();
+        let pos = (screen.center() - (PRESETS_SIZE + vec2(12.0, 40.0)) / 2.0).max(screen.min);
+        Window::new(PRESETS_TITLE)
+            .id(Id::new(("presets", m.opens)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_pos(pos)
+            .default_size(PRESETS_SIZE)
+            .min_size(PRESETS_MIN)
+            .show(ctx, |ui| {
+                let area = ui.available_rect_before_wrap();
+                ui.allocate_rect(area, Sense::hover());
+                // The window's own colour reaches out to its frame at the sides and bottom.
+                let margin = ui.style().spacing.window_margin;
+                let fill = Rect::from_min_max(
+                    pos2(area.left() - f32::from(margin.left), area.top()),
+                    pos2(area.right() + f32::from(margin.right), area.bottom() + f32::from(margin.bottom)),
+                );
+                let rad = ui.visuals().window_corner_radius;
+                let corners = CornerRadius { nw: 0, ne: 0, sw: rad.sw.saturating_sub(1), se: rad.se.saturating_sub(1) };
+                let mut bg = ui.painter().clone();
+                bg.set_clip_rect(fill);
+                bg.rect_filled(fill, corners, rgb(PRESETS_BG));
+                let (w, h) = (area.width(), area.height());
+                let at = |x: f32, y: f32, rw: f32, rh: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(rw, rh));
+                ui.painter().rect_filled(at(7.0, 7.0, w - 104.0, h - 13.0), CornerRadius::ZERO, colours::draw(TREE_SHADE));
+                preset_tree(ui, at(8.0, 8.0, w - 106.0, h - 15.0), &root, c, &mut m);
+                let text = c.get(colours::TEXT);
+                for (y, label, tip, o) in PRESET_BUTTONS {
+                    if fitted_button(ui, at(w - 90.0, y, 82.0, 24.0), label, true, text).on_hover_text(tip).clicked() {
+                        op = Some(o);
                     }
-                });
+                }
             });
-            if let (Some(n), true) = (&node_name, can_load) {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Save {n}'s settings as:"));
-                    ui.add(TextEdit::singleline(&mut st.name).desired_width(150.0));
-                    save = ui.add_enabled(!st.name.trim().is_empty(), Button::new("Save")).clicked();
-                });
+        if let Some(o) = op {
+            self.preset_op(ctx, &mut m, o);
+        }
+        if open {
+            self.dlg.presets = Some(m);
+        }
+    }
+
+    /// A manager button (buttonClicked, 0x14008b450). Each but Import needs a selected preset.
+    fn preset_op(&mut self, ctx: &Context, m: &mut PresetManager, op: PresetOp) {
+        let root = presets::root();
+        let sel = m.sel.clone();
+        match (op, sel) {
+            (PresetOp::Rename | PresetOp::Copy, Some(target)) => {
+                let mut pr = PresetPrompt::new(if matches!(op, PresetOp::Rename) { PromptKind::Rename } else { PromptKind::Copy });
+                pr.target = Some(target);
+                m.prompt = Some(pr);
             }
-            ui.separator();
-            if st.folder.is_some() && presets.is_empty() {
-                ui.label("No presets saved for this plugin yet.");
+            // The original asks for the plugin first and then for the file.
+            (PresetOp::Import, _) => {
+                let mut pr = PresetPrompt::new(PromptKind::Import);
+                pr.choices = plugin_folders(&self.settings.plugins);
+                m.prompt = Some(pr);
             }
-            ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                Grid::new("presets").num_columns(2).striped(true).show(ui, |ui| {
-                    for p in &presets {
-                        if ui.selectable_label(st.selected.as_deref() == Some(p.as_str()), p).clicked() {
-                            st.selected = Some(p.clone());
-                            st.rename = p.clone();
+            // Remove deletes the file straight away, and the plugin's folder once nothing is left
+            // in it (0x14008b8ec).
+            (PresetOp::Remove, Some((f, n))) => {
+                let dir = root.join(&f);
+                match std::fs::remove_file(presets::preset_path(&dir, &n)) {
+                    Ok(()) => {
+                        if std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
+                            let _ = std::fs::remove_dir(&dir);
                         }
-                        ui.horizontal(|ui| {
-                            if can_load && ui.small_button("Load").clicked() {
-                                load = Some(p.clone());
-                            }
-                            if ui.small_button("Delete").clicked() {
-                                delete = Some(p.clone());
-                            }
-                        });
-                        ui.end_row();
+                        m.sel = None;
                     }
-                });
+                    Err(_) => self.message(DELETE_ERROR_TITLE, DELETE_ERROR),
+                }
+                m.refresh();
+                self.presets_changed();
+            }
+            // Export copies the preset's file to one the person names, always ending in .fxp
+            // (withFileExtension, 0x14008b450); the chooser asks before writing over a file.
+            (PresetOp::Export, Some((f, n))) => {
+                let src = presets::preset_path(&root.join(&f), &n);
+                let Some(mut dest) = presets::choose_fxp(EXPORT_PRESET_TITLE, self.hwnd, Some(&format!("{n}.fxp"))) else { return };
+                let mut added = false;
+                if !dest.extension().is_some_and(|e| e.eq_ignore_ascii_case("fxp")) {
+                    let mut s = dest.into_os_string();
+                    s.push(".fxp");
+                    dest = PathBuf::from(s);
+                    added = true;
+                }
+                // The chooser only asked about the name as it was typed, so a file the added .fxp
+                // lands on is never written over.
+                if !same_file(&src, &dest) {
+                    if added && dest.exists() {
+                        self.message(presets::ERROR_TITLE, &format!("{} already exists.", dest.display()));
+                    } else if let Err(e) = std::fs::copy(&src, &dest) {
+                        self.message(presets::ERROR_TITLE, &format!("Could not export the preset \"{n}\": {e}"));
+                    }
+                }
+                m.refresh();
+                self.presets_changed();
+            }
+            _ => {}
+        }
+        if m.prompt.is_some() {
+            // The prompt takes the keyboard from here on.
+            ctx.memory_mut(|mm| {
+                if let Some(id) = mm.focused() {
+                    mm.surrender_focus(id);
+                }
             });
-            if let Some(sel) = st.selected.clone().filter(|s| presets.contains(s)) {
-                ui.horizontal(|ui| {
-                    ui.label("Rename to:");
-                    ui.add(TextEdit::singleline(&mut st.rename).desired_width(180.0));
-                    let to = st.rename.trim().to_string();
-                    if ui.add_enabled(!to.is_empty() && to != sel, Button::new("Rename")).clicked() {
-                        rename = Some((sel, to));
-                    }
+            ctx.request_repaint();
+        }
+    }
+
+    /// The manager's prompts (buttonClicked, 0x14008b450): Copy Preset and Rename Preset ask for a
+    /// name in a text box, Import Preset for the plugin in a list, each with Cancel and Ok. Return
+    /// is Ok and Escape does nothing, as no button has it. Nothing else takes input meanwhile.
+    pub fn preset_prompt(&mut self, ctx: &Context) {
+        let Some(mut m) = self.dlg.presets.take() else { return };
+        let Some(mut pr) = m.prompt.take() else {
+            self.dlg.presets = Some(m);
+            return;
+        };
+        let (mut ok, mut cancel) = (false, false);
+        if pr.kind != PromptKind::Import {
+            // The text box would let go of the keyboard on Return or Escape.
+            ctx.input_mut(|i| {
+                ok = i.consume_key(Modifiers::NONE, Key::Enter);
+                i.consume_key(Modifiers::NONE, Key::Escape);
+            });
+        } else if !ctx.memory(|mm| mm.any_popup_open() || mm.focused().is_some()) {
+            // An open list takes Return itself, and a focused button or list takes it too.
+            ok = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        }
+        let (title, message) = pr.kind.words();
+        let lay = alert_layout(ctx, title, message, &PROMPT_BUTTONS, ctx.screen_rect().size());
+        let (bg, text) = (self.scheme.get(colours::WINDOW_BG), Color32::BLACK);
+        let frame = Frame::NONE.fill(bg).shadow(ctx.style().visuals.window_shadow);
+        let c = &self.scheme;
+        Modal::new(Id::new("preset_prompt")).backdrop_color(Color32::TRANSPARENT).frame(frame).show(ctx, |ui| {
+            let (area, _) = ui.allocate_exact_size(lay.size, Sense::hover());
+            let p = ui.painter().clone();
+            p.rect_stroke(area, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(0x66)), StrokeKind::Inside);
+            for (top, s, f) in &lay.lines {
+                let r = Rect::from_min_size(pos2(area.left(), area.top() + top), vec2(area.width(), f.size));
+                text_at(&p, area.center().x, baseline(r, f.size), Align::Center, s, f.clone(), text);
+            }
+            let field = lay.combo.translate(area.min.to_vec2());
+            if pr.kind == PromptKind::Import {
+                ui.scope_builder(UiBuilder::new().max_rect(field), |ui| {
+                    ui.spacing_mut().interact_size.y = field.height();
+                    let shown = pr.choices.get(pr.pick).cloned().unwrap_or_default();
+                    ComboBox::from_id_salt("plugins").width(field.width()).truncate().selected_text(shown).show_ui(ui, |ui| {
+                        for (i, n) in pr.choices.iter().enumerate() {
+                            ui.selectable_value(&mut pr.pick, i, n.as_str());
+                        }
+                    });
                 });
+            } else {
+                name_box(ui, field, &mut pr.text, &mut pr.fresh, c);
+            }
+            for (k, (label, r)) in PROMPT_BUTTONS.into_iter().zip(&lay.buttons).enumerate() {
+                let r = r.translate(area.min.to_vec2());
+                let b = ui.scope_builder(UiBuilder::new().max_rect(r), |ui| ui.add(Button::new(RichText::new(label).font(font(ALERT_FONT))).min_size(r.size()))).inner;
+                if b.clicked() {
+                    cancel |= k == 0;
+                    ok |= k == 1;
+                }
             }
         });
-        let folder = st.folder.clone().map(|f| root.join(f));
-        let (node, name) = (st.node, safe(st.name.trim()));
-        if !open {
-            self.dlg.presets = None;
+        if ok {
+            self.finish_prompt(&mut m, pr);
+        } else if !cancel {
+            m.prompt = Some(pr);
         }
-        let Some(folder) = folder else { return };
-        let file = |n: &str| folder.join(format!("{}.preset", safe(n)));
-        let mut err = None;
-        if save {
-            match node.and_then(|id| self.graph.node_mut(id)).and_then(|n| n.state_b64()) {
-                Some(text) => {
-                    if let Err(e) = std::fs::create_dir_all(&folder).and_then(|_| std::fs::write(file(&name), text)) {
-                        err = Some(format!("Could not save the preset: {e}"));
-                    } else if let Some(st) = self.dlg.presets.as_mut() {
-                        st.name.clear();
-                    }
+        if ok || cancel {
+            ctx.memory_mut(|mm| mm.close_popup());
+            ctx.request_repaint();
+        }
+        self.dlg.presets = Some(m);
+    }
+
+    /// Ok in a prompt. Copy and Rename act in the preset's own folder; Import asks for the file
+    /// and copies it into the picked plugin's folder, making the folder if needed.
+    fn finish_prompt(&mut self, m: &mut PresetManager, pr: PresetPrompt) {
+        let root = presets::root();
+        let done = match (pr.kind, pr.target) {
+            (PromptKind::Copy, Some((f, n))) => copy_preset(&root.join(&f), &n, &pr.text).map(|_| ()),
+            (PromptKind::Rename, Some((f, n))) => rename_preset(&root.join(&f), &n, &pr.text).map(|to| m.sel = Some((f, to))),
+            (PromptKind::Import, _) => {
+                let Some(f) = pr.choices.get(pr.pick).cloned() else { return };
+                let Some(file) = presets::choose_fxp(IMPORT_PRESET_TITLE, self.hwnd, None) else { return };
+                let dir = root.join(&f);
+                if std::fs::create_dir_all(&dir).is_err() {
+                    self.message(IMPORT_ERROR_TITLE, IMPORT_ERROR);
+                    return;
                 }
-                None => err = Some("This processor has no settings to save.".into()),
+                import_preset(&dir, &file).map(|n| {
+                    m.closed.remove(&f);
+                    m.sel = Some((f, n));
+                })
             }
+            _ => Ok(()),
+        };
+        if let Err(e) = done {
+            self.message(presets::ERROR_TITLE, &e);
         }
-        if let Some(p) = load {
-            let ok = std::fs::read_to_string(file(&p)).ok().zip(node.and_then(|id| self.graph.node_mut(id))).is_some_and(|(t, n)| n.set_state_b64(t.trim()));
-            if ok {
-                self.dirty = true;
-            } else {
-                err = Some(format!("Could not load the preset \"{p}\"."));
-            }
-        }
-        if let Some(p) = delete {
-            if let Err(e) = std::fs::remove_file(file(&p)) {
-                err = Some(format!("Could not delete the preset: {e}"));
-            }
-        }
-        if let Some((from, to)) = rename {
-            match std::fs::rename(file(&from), file(&to)) {
-                Ok(()) => {
-                    if let Some(st) = self.dlg.presets.as_mut() {
-                        st.selected = Some(safe(&to));
-                    }
-                }
-                Err(e) => err = Some(format!("Could not rename the preset: {e}")),
-            }
-        }
-        if let Some(e) = err {
-            self.message("User Presets", &e);
-        }
+        m.refresh();
+        self.presets_changed();
     }
 }
 
@@ -1023,5 +1512,42 @@ mod tests {
         assert_eq!(move_row(&mut p, &mut cur, &mut set(&[2]), false), None);
         assert_eq!(move_row(&mut p, &mut cur, &mut set(&[]), false), None);
         assert_eq!(names(&p), ["C", "B", "A"]);
+    }
+
+    #[test]
+    fn tree_presses_pick_items_and_toggle_folders_from_their_box() {
+        assert_eq!(tree_hit(TreeRow::Folder(0), 0.0), TreeHit::Toggle);
+        assert_eq!(tree_hit(TreeRow::Folder(0), 23.5), TreeHit::Toggle);
+        assert_eq!(tree_hit(TreeRow::Folder(0), 24.0), TreeHit::Select);
+        assert_eq!(tree_hit(TreeRow::Preset(0, 0), 30.0), TreeHit::Nothing);
+        assert_eq!(tree_hit(TreeRow::Preset(0, 0), 5.0), TreeHit::Nothing);
+        assert_eq!(tree_hit(TreeRow::Preset(0, 0), 48.0), TreeHit::Select);
+        let tree = vec![("A".to_string(), vec!["x".to_string()]), ("B".to_string(), vec!["y".to_string()])];
+        let closed: BTreeSet<String> = ["A".to_string()].into();
+        assert_eq!(tree_rows(&tree, &closed), [TreeRow::Folder(0), TreeRow::Folder(1), TreeRow::Preset(1, 0)]);
+    }
+
+    #[test]
+    fn manager_copies_renames_and_imports_without_writing_over_presets() {
+        let dir = std::env::temp_dir().join(format!("pedalhost-test-manager-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let other = dir.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(presets::preset_path(&dir, "Lead"), b"lead").unwrap();
+        std::fs::write(presets::preset_path(&dir, "Pad"), b"pad").unwrap();
+        assert_eq!(copy_preset(&dir, "Lead", " Lead 2 ").unwrap(), "Lead 2");
+        assert_eq!(std::fs::read(presets::preset_path(&dir, "Lead 2")).unwrap(), b"lead");
+        assert!(copy_preset(&dir, "Lead", "Pad").is_err());
+        assert!(rename_preset(&dir, "Lead", "Pad").is_err());
+        assert!(rename_preset(&dir, "Lead", "a/b").is_err());
+        assert_eq!(rename_preset(&dir, "Lead", "LEAD").unwrap(), "LEAD");
+        assert_eq!(presets::list(&dir), ["LEAD", "Lead 2", "Pad"]);
+        std::fs::write(other.join("Pad.fxp"), b"other pad").unwrap();
+        std::fs::write(other.join("Bass.fxp"), b"bass").unwrap();
+        assert!(import_preset(&dir, &other.join("Pad.fxp")).is_err());
+        assert_eq!(std::fs::read(presets::preset_path(&dir, "Pad")).unwrap(), b"pad");
+        assert_eq!(import_preset(&dir, &other.join("Bass.fxp")).unwrap(), "Bass");
+        assert_eq!(std::fs::read(presets::preset_path(&dir, "Bass")).unwrap(), b"bass");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
