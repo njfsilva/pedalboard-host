@@ -6,6 +6,7 @@
 //! dropped there.
 
 pub mod asio;
+pub mod latency;
 pub mod wasapi;
 
 use crate::settings::AudioConfig;

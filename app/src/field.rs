@@ -439,7 +439,7 @@ impl Field {
                     let cr = control_rect(r, b.kind.control_size());
                     b.ui(&mut fu, cr, id.with(("ctl", nid)), c);
                 }
-                NodeKind::Missing(_) => {
+                NodeKind::Missing { .. } => {
                     text_at(&p, r.center().x, o.y + r.height() - 30.0, Align::Center, "(not found)", font(LABEL_FONT), Color32::from_rgb(170, 30, 30));
                 }
                 _ => {}

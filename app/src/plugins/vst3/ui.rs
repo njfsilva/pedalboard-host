@@ -10,7 +10,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
-/// Saved state: this tag, then the processor's and the controller's state, each length-prefixed.
+/// Two length-prefixed state chunks, optionally followed by unprocessed (ParamID, value) edits.
 const STATE_TAG: &[u8] = b"PBV3";
 
 pub struct V3Ui {
@@ -22,12 +22,11 @@ pub struct V3Ui {
     view: Option<Com<PlugViewVtbl>>,
     win: Option<EditorWindow>,
     frame: *mut Frame,
-    latency: u32,
 }
 
 impl V3Ui {
-    pub(super) fn new(inst: Arc<Instance>, name: String, params: Vec<Param>, shared: Arc<Shared>, from_audio: rtrb::Consumer<(u32, f64)>, latency: u32) -> V3Ui {
-        V3Ui { inst, name, params, shared, from_audio, view: None, win: None, frame: new_frame(), latency }
+    pub(super) fn new(inst: Arc<Instance>, name: String, params: Vec<Param>, shared: Arc<Shared>, from_audio: rtrb::Consumer<(u32, f64)>) -> V3Ui {
+        V3Ui { inst, name, params, shared, from_audio, view: None, win: None, frame: new_frame() }
     }
 
     fn controller(&self) -> Option<&Com<EditControllerVtbl>> {
@@ -70,9 +69,11 @@ fn chunk(d: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((body, &d[4 + n..]))
 }
 
-fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
+fn split_state(data: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     let (a, rest) = chunk(data.strip_prefix(STATE_TAG)?)?;
-    Some((a, chunk(rest).map_or(&[][..], |(b, _)| b)))
+    let (b, tail) = if rest.is_empty() { (&[][..], &[][..]) } else { chunk(rest)? };
+    let edits = if tail.is_empty() { tail } else { tail.strip_prefix(b"EDIT")? };
+    (edits.len() % 12 == 0).then_some((a, b, edits))
 }
 
 impl PluginUi for V3Ui {
@@ -126,6 +127,14 @@ impl PluginUi for V3Ui {
         }
     }
 
+    fn select_program_after_state(&mut self, i: i32) {
+        // The component already has the saved sound. Sending another factory program
+        // change on the next audio block would overwrite any edits to that sound.
+        if let (Some(p), Some(c)) = (self.program_param(), self.controller()) {
+            unsafe { (c.vt().set_param_normalized)(c.ptr(), p.id, i as f64 / p.steps as f64) };
+        }
+    }
+
     fn program_name(&self, i: i32) -> String {
         match self.program_param() {
             Some(p) => self.text_for(p.id, i.clamp(0, p.steps) as f64 / p.steps as f64),
@@ -134,6 +143,7 @@ impl PluginUi for V3Ui {
     }
 
     fn get_state(&mut self) -> Vec<u8> {
+        let mut pending = self.shared.processing.lock().unwrap_or_else(|e| e.into_inner());
         let comp = &self.inst.component;
         let a = stream_out(|s| unsafe { (comp.vt().get_state)(comp.ptr(), s) });
         let b = match self.controller() {
@@ -146,24 +156,49 @@ impl PluginUi for V3Ui {
         out.extend_from_slice(&a);
         out.extend_from_slice(&(b.len() as u32).to_le_bytes());
         out.extend_from_slice(&b);
+        let count = pending.slots();
+        if count > 0 {
+            out.extend_from_slice(b"EDIT");
+            let queued = pending.read_chunk(count).unwrap();
+            let (first, second) = queued.as_slices();
+            for (id, value) in first.iter().chain(second) {
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
         out
     }
 
     fn set_state(&mut self, data: &[u8]) -> bool {
-        let Some((a, b)) = split_state(data) else { return false };
+        let Some((a, b, edits)) = split_state(data) else { return false };
+        let shared = Arc::clone(&self.shared);
+        let mut pending = shared.processing.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_edits = pending.slots();
         unsafe {
             let comp = &self.inst.component;
             let s = MemStream::new(a.to_vec());
-            let ok = (comp.vt().set_state)(comp.ptr(), s.ptr()) == OK;
+            let mut restored = (comp.vt().set_state)(comp.ptr(), s.ptr()) == OK;
             if let Some(c) = self.controller() {
                 s.rewind();
                 (c.vt().set_component_state)(c.ptr(), s.ptr());
                 if !b.is_empty() {
                     let s2 = MemStream::new(b.to_vec());
-                    (c.vt().set_state)(c.ptr(), s2.ptr());
+                    let controller_restored = (c.vt().set_state)(c.ptr(), s2.ptr()) == OK;
+                    restored |= a.is_empty() && controller_restored;
                 }
             }
-            ok
+            if !restored {
+                return false;
+            }
+            // Keep notifications emitted during restore, discarding only the prior sound's edits.
+            pending.read_chunk(previous_edits).unwrap().commit_all();
+            while self.from_audio.pop().is_ok() {}
+            for edit in edits.chunks_exact(12) {
+                let id = u32::from_le_bytes(edit[..4].try_into().unwrap());
+                let value = f64::from_le_bytes(edit[4..].try_into().unwrap());
+                self.set_normalized(id, value);
+            }
+            true
         }
     }
 
@@ -245,7 +280,7 @@ impl PluginUi for V3Ui {
         }
     }
 
-    fn idle(&mut self) {
+    fn idle(&mut self) -> bool {
         // Values the processor reported (meters, MIDI-mapped moves) reach the controller and its window.
         if let Some(c) = &self.inst.controller {
             while let Ok((id, v)) = self.from_audio.pop() {
@@ -253,10 +288,6 @@ impl PluginUi for V3Ui {
             }
         }
         let flags = self.shared.restart.swap(0, Relaxed);
-        if flags & RESTART_LATENCY != 0 {
-            let p = &self.inst.processor;
-            self.latency = unsafe { (p.vt().get_latency_samples)(p.ptr()) };
-        }
         if flags & RESTART_PARAM_TITLES != 0 {
             let fresh = unsafe { read_params(&self.inst) };
             if fresh.len() == self.params.len() {
@@ -266,10 +297,19 @@ impl PluginUi for V3Ui {
         if self.win.as_ref().is_some_and(|w| w.closed()) {
             self.close_editor();
         }
+        if flags & RESTART_LATENCY != 0 {
+            let _between_blocks = self.shared.processing.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                self.inst.deactivate();
+                self.inst.start_processing();
+            }
+            return true;
+        }
+        false
     }
 
     fn latency(&self) -> u32 {
-        self.latency
+        self.inst.latency_samples.load(Relaxed)
     }
 }
 

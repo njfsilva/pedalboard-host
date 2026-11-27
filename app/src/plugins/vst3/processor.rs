@@ -2,7 +2,7 @@
 //! front: bus tables, parameter queues, the note list and the transport context.
 
 use super::com::*;
-use super::host::{EventList, ParamChanges};
+use super::host::{EventList, ParamChanges, Shared};
 use super::{Instance, MIDI_CTRLS};
 use crate::engine::{MidiEvent, ProcessArgs, Processor, MIDI_CAP};
 use std::ptr::null_mut;
@@ -22,7 +22,7 @@ pub struct V3Proc {
     params_out: Box<ParamChanges>,
     events: Box<EventList>,
     ctx: ProcessContext,
-    from_ui: rtrb::Consumer<(u32, f64)>,
+    shared: Arc<Shared>,
     to_ui: rtrb::Producer<(u32, f64)>,
     param_ids: Vec<u32>,
     midi_map: Vec<u32>,
@@ -55,7 +55,7 @@ impl V3Proc {
         out_ch: Vec<i32>,
         param_ids: Vec<u32>,
         midi_map: Vec<u32>,
-        from_ui: rtrb::Consumer<(u32, f64)>,
+        shared: Arc<Shared>,
         to_ui: rtrb::Producer<(u32, f64)>,
         block: usize,
     ) -> V3Proc {
@@ -74,7 +74,7 @@ impl V3Proc {
             params_out: ParamChanges::new(queues),
             events: EventList::new(MIDI_CAP),
             ctx: ProcessContext::default(),
-            from_ui,
+            shared,
             to_ui,
             param_ids,
             midi_map,
@@ -162,7 +162,16 @@ impl Processor for V3Proc {
         for i in 0..main_out {
             self.out_ptrs[i] = if i < a.outputs.len() { a.outputs[i] } else { self.out_bufs[i].as_mut_ptr() };
         }
-        while let Ok((id, v)) = self.from_ui.pop() {
+        // State transfers and latency restarts run between blocks. Leave queued edits
+        // intact and keep the other branches running while this instance is busy.
+        let shared = Arc::clone(&self.shared);
+        let Ok(mut pending) = shared.processing.try_lock() else {
+            for i in 0..a.outputs.len() {
+                a.output(i).fill(0.0);
+            }
+            return;
+        };
+        while let Ok((id, v)) = pending.pop() {
             self.params_in.add(id, 0, v);
         }
         self.events.clear();

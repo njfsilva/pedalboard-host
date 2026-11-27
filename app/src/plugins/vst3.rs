@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::mem::zeroed;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const AUDIO_CLASS: &str = "Audio Module Class";
@@ -136,6 +136,7 @@ struct Instance {
     links: Option<(Com<ConnectionPointVtbl>, Com<ConnectionPointVtbl>)>,
     handler: *mut c_void,
     active: AtomicBool,
+    latency_samples: AtomicU32,
 }
 
 unsafe impl Send for Instance {}
@@ -153,7 +154,10 @@ impl Instance {
             (component.vt().terminate)(component.ptr());
             return Err("The plugin has no audio processor.".into());
         };
-        Ok(Instance { component, processor, controller: None, separate: false, links: None, handler: null_mut(), active: AtomicBool::new(false) })
+        Ok(Instance {
+            component, processor, controller: None, separate: false, links: None, handler: null_mut(),
+            active: AtomicBool::new(false), latency_samples: AtomicU32::new(0),
+        })
     }
 
     /// Finds or creates the edit controller, connects the two halves and gives the controller
@@ -199,7 +203,13 @@ impl Instance {
         self.deactivate();
         let mut setup = ProcessSetup { process_mode: MODE_REALTIME, sample_size: SAMPLE_32, max_samples: block as i32, sample_rate };
         (self.processor.vt().setup_processing)(self.processor.ptr(), &mut setup);
+        self.start_processing();
+    }
+
+    unsafe fn start_processing(&self) {
         (self.component.vt().set_active)(self.component.ptr(), 1);
+        let latency = (self.processor.vt().get_latency_samples)(self.processor.ptr());
+        self.latency_samples.store(latency, Relaxed);
         (self.processor.vt().set_processing)(self.processor.ptr(), 1);
         self.active.store(true, Relaxed);
     }
@@ -350,7 +360,7 @@ pub fn load(info: &PluginInfo, sample_rate: f64, block: usize) -> Result<Loaded,
         let (in_ch, out_ch) = inst.setup_buses();
         let (to_audio, from_ui) = rtrb::RingBuffer::new(1024);
         let (to_ui, from_audio) = rtrb::RingBuffer::new(1024);
-        let shared = Arc::new(Shared { to_audio: Mutex::new(to_audio), restart: AtomicI32::new(0) });
+        let shared = Arc::new(Shared { to_audio: Mutex::new(to_audio), processing: Mutex::new(from_ui), restart: AtomicI32::new(0) });
         inst.handler = new_handler(shared.clone());
         if let Some(c) = &inst.controller {
             (c.vt().set_component_handler)(c.ptr(), inst.handler);
@@ -359,14 +369,84 @@ pub fn load(info: &PluginInfo, sample_rate: f64, block: usize) -> Result<Loaded,
         let midi_map = read_midi_map(&inst);
         let block = block.max(16);
         inst.activate(sample_rate, block);
-        let latency = (inst.processor.vt().get_latency_samples)(inst.processor.ptr());
         let inst = Arc::new(inst);
         let ins = in_ch.first().copied().unwrap_or(0) as usize;
         let outs = out_ch.first().copied().unwrap_or(0) as usize;
         let name = if info.name.is_empty() { class.name.clone() } else { info.name.clone() };
         let ids = params.iter().map(|p| p.id).collect();
-        let proc_ = processor::V3Proc::new(inst.clone(), in_ch, out_ch, ids, midi_map, from_ui, to_ui, block);
-        let ui = ui::V3Ui::new(inst, name, params, shared, from_audio, latency);
+        let proc_ = processor::V3Proc::new(inst.clone(), in_ch, out_ch, ids, midi_map, shared.clone(), to_ui, block);
+        let ui = ui::V3Ui::new(inst, name, params, shared, from_audio);
         Ok(Loaded { ui: Box::new(ui), proc_: Box::new(proc_), ins, outs })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{ProcessArgs, Transport};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+
+    #[test]
+    #[ignore = "requires FabFilter Pro-L 2, with PRO_L_VST3 pointing to the installed plug-in"]
+    fn pro_l_reported_delay_matches_the_rendered_impulse_after_live_edits() {
+        let path = PathBuf::from(std::env::var_os("PRO_L_VST3").expect("set PRO_L_VST3"));
+        let info = scan(&path).unwrap().remove(0);
+        let rate = 48000.0;
+        let frames = 256;
+        let mut plugin = load(&info, rate, frames).unwrap();
+        let param = |name: &str| (0..plugin.ui.num_params()).find(|&i| plugin.ui.param_name(i).eq_ignore_ascii_case(name)).expect(name);
+        let lookahead = param("Lookahead");
+        let true_peak = param("True Peak Limiting");
+        let style = param("Style");
+        let mut transport = Transport { sample_rate: rate, playing: true, tempo: 120.0, sample_pos: 0, num: 4, den: 4 };
+        let mut input = vec![0.0; frames];
+        let inputs = vec![input.as_ptr(); plugin.ins];
+        let mut output = vec![vec![0.0; frames]; plugin.outs];
+        let outputs: Vec<_> = output.iter_mut().map(|ch| ch.as_mut_ptr()).collect();
+
+        plugin.ui.set_param(style, 5.0 / 7.0); // Modern
+        plugin.ui.set_param(true_peak, 1.0);
+        let mut check = |param, value| {
+            plugin.ui.set_param(param, value);
+            let end = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < end {
+                unsafe {
+                    let mut msg: MSG = zeroed();
+                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                plugin.proc_.process(&ProcessArgs { inputs: &inputs, outputs: &outputs, frames, midi_in: &[], transport: &transport });
+                transport.sample_pos += frames as i64;
+                plugin.ui.idle();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let reported = plugin.ui.latency() as usize;
+            let mut peak = (0.0, 0);
+            for block in 0..48 {
+                input[0] = if block == 0 { 0.1 } else { 0.0 };
+                plugin.proc_.process(&ProcessArgs { inputs: &inputs, outputs: &outputs, frames, midi_in: &[], transport: &transport });
+                transport.sample_pos += frames as i64;
+                for (i, sample) in output[0].iter().enumerate() {
+                    if sample.abs() > peak.0 {
+                        peak = (sample.abs(), block * frames + i);
+                    }
+                }
+            }
+            eprintln!("{} {}: reported {reported}, impulse peak at {} samples", plugin.ui.param_name(param), plugin.ui.param_text(param), peak.1);
+            assert!(peak.0 > 0.001);
+            assert_eq!(reported, peak.1);
+            reported
+        };
+        // Lookahead can use delay the current style already has. Check actual audio at both extremes.
+        check(lookahead, 0.0);
+        let modern = check(lookahead, 1.0);
+        let transparent = check(style, 0.0);
+        assert!(transparent < modern);
+        let peak_off = check(true_peak, 0.0);
+        assert!(peak_off < transparent);
+        assert_eq!(check(true_peak, 1.0), transparent);
     }
 }

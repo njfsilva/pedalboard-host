@@ -5,6 +5,7 @@ use crate::bars::MenuState;
 use crate::app_mappings::{self, Mappings};
 use crate::colours::{self, Scheme};
 use crate::dialogs::Dialogs;
+use crate::engine::latency::{LatencyRoutes, NodeLatency};
 use crate::engine::{Engine, Plan};
 use crate::field::{Action, Field};
 use crate::graph::{Ctx, Graph, NodeKind};
@@ -24,6 +25,7 @@ pub const TITLE: &str = "Pedalboard Host";
 pub const UNTITLED: &str = "<untitled>";
 const MENU_H: f32 = 24.0;
 const BAR_H: f32 = 40.0;
+const LATENCY_REFRESH: Duration = Duration::from_millis(250);
 const LOG_LINES: usize = 2000;
 /// How often the window draws while audio runs, for the meters and the CPU display; the app
 /// keeps the same pace while its window is in the tray.
@@ -157,6 +159,9 @@ pub struct App {
     pub scheme: Scheme,
     pub engine: Engine,
     pub graph: Graph,
+    latency_routes: LatencyRoutes,
+    next_latency_refresh: Instant,
+    pub latency_text: String,
     pub field: Field,
     pub patches: Vec<Patch>,
     pub current: usize,
@@ -253,6 +258,9 @@ impl App {
             scheme,
             engine: Engine::new(),
             graph: Graph::default(),
+            latency_routes: LatencyRoutes::default(),
+            next_latency_refresh: Instant::now(),
+            latency_text: String::new(),
             field: Field::default(),
             patches: vec![Patch::untitled(120.0)],
             current: 0,
@@ -338,7 +346,23 @@ impl App {
     /// Hands the audio thread a fresh, pre-built processing plan for the current patch.
     pub fn rebuild(&mut self) {
         let plan = Plan::build(&self.graph.desc(), self.engine.block(), self.engine.active_ins(), self.engine.active_outs());
+        self.latency_routes = plan.latency_routes();
+        self.next_latency_refresh = Instant::now();
         self.engine.set_plan(plan);
+    }
+
+    fn refresh_latency(&mut self) {
+        let now = Instant::now();
+        if now >= self.next_latency_refresh {
+            let nodes: std::collections::HashMap<_, _> = self.graph.nodes.iter().map(|n| (n.id, n)).collect();
+            let samples = self.latency_routes.output_samples(|id| nodes.get(&id).map_or(NodeLatency::Silent, |n| n.latency()));
+            let ms = samples as f64 * 1000.0 / self.engine.sample_rate();
+            self.latency_text = format!("Latency: {ms:.2} ms");
+            self.next_latency_refresh = now + LATENCY_REFRESH;
+        }
+        if !self.engine.running {
+            self.egui_ctx.request_repaint_after(self.next_latency_refresh - now);
+        }
     }
 
     /// (Re)opens the configured audio device and starts it.
@@ -535,8 +559,8 @@ impl App {
                 }
             }
         }
+        self.current = root.get("currentPatch").and_then(|s| s.parse::<usize>().ok()).filter(|&i| i < patches.len()).unwrap_or(0);
         self.patches = patches;
-        self.current = 0;
         self.load_current();
         Ok(())
     }
@@ -645,9 +669,14 @@ impl App {
                 self.save(true);
             }
             Cmd::SaveAsDefault => {
-                let _ = std::fs::create_dir_all(settings::dir());
-                let doc = self.document().to_document();
-                if let Err(e) = std::fs::write(default_file(), doc) {
+                let doc = self.document().attr("currentPatch", self.current).to_document();
+                let path = default_file();
+                let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+                let result = std::fs::create_dir_all(settings::dir())
+                    .and_then(|_| std::fs::write(&temp, doc))
+                    .and_then(|_| std::fs::rename(&temp, &path));
+                if let Err(e) = result {
+                    let _ = std::fs::remove_file(temp);
                     self.message("File error", &format!("Could not save the default patch file: {e}"));
                 }
             }
@@ -785,6 +814,7 @@ impl App {
                 Action::Bypass(id) => {
                     if let Some(n) = self.graph.node(id) {
                         n.set_bypass(!n.bypassed());
+                        self.next_latency_refresh = Instant::now();
                         self.dirty = true;
                     }
                 }
@@ -803,9 +833,12 @@ impl App {
                     }
                 }
                 Action::SetProgram(id, k) => {
-                    if let Some(p) = self.graph.node_mut(id).and_then(|n| n.plugin()) {
-                        p.set_program(k);
-                        self.dirty = true;
+                    if let Some(n) = self.graph.node_mut(id) {
+                        if let Some(p) = n.plugin() {
+                            p.set_program(k);
+                            n.user_preset = None;
+                            self.dirty = true;
+                        }
                     }
                     self.sync_bar(id);
                 }
@@ -962,7 +995,11 @@ impl eframe::App for App {
                         b.tick(sr);
                         errors.extend(b.error.take());
                     }
-                    NodeKind::Plugin(p) => p.idle(),
+                    NodeKind::Plugin(p) => {
+                        if p.idle() {
+                            self.next_latency_refresh = Instant::now();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -986,6 +1023,7 @@ impl eframe::App for App {
             let field_r = Rect::from_min_max(panel.min, pos2(panel.right(), panel.bottom() - BAR_H + 1.0));
             let acts = self.field.show(ui, field_r, &mut self.graph, &self.scheme, &self.settings.plugins);
             self.apply(acts);
+            self.refresh_latency();
             self.bottom_bar(ui, panel);
             self.menu_bar(ui, menu_r);
         });

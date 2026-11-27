@@ -286,6 +286,9 @@ unsafe extern "system" fn attr_get_binary(this: *mut c_void, id: *const c_char, 
 pub struct Shared {
     /// Parameter changes on their way to the processor (from the plugin's window or the host).
     pub to_audio: Mutex<rtrb::Producer<(u32, f64)>>,
+    /// Held from dequeue through processing so a state snapshot sees each edit either
+    /// in the processor's state or still in this queue.
+    pub processing: Mutex<rtrb::Consumer<(u32, f64)>>,
     /// `restartComponent` flags not yet handled.
     pub restart: AtomicI32,
 }

@@ -292,9 +292,15 @@ impl App {
         triangle(&p, m + vec2(-6.0, 0.0), m + vec2(3.0, -6.0), m + vec2(3.0, 6.0), vector, Stroke::NONE);
         p.rect_filled(Rect::from_min_size(m + vec2(3.5, -6.0), vec2(2.5, 12.0)), CornerRadius::ZERO, vector);
 
-        // CPU meter.
-        label(ui, at(w - 236.0, h - 33.0, 78.0, 24.0), "CPU Usage:");
-        let mr = at(w - 154.0, h - 33.0, 148.0, 24.0);
+        // Keep the readout beside CPU Usage and shorten the meter on smaller windows.
+        let latency_width = (text_w(ui, &self.latency_text, font(BAR_FONT)) + 10.0).min(165.0);
+        let cpu_left = (w - 236.0).max(cx + 48.0 + latency_width);
+        let latency_rect = at(cpu_left - latency_width, h - 33.0, latency_width, 24.0);
+        label(ui, latency_rect, &self.latency_text);
+        ui.interact(latency_rect, Id::new("chain_latency"), Sense::hover())
+            .on_hover_text("Plug-in delay on the longest audio path to the output. Excludes audio device latency.");
+        label(ui, at(cpu_left, h - 33.0, 78.0, 24.0), "CPU Usage:");
+        let mr = at(cpu_left + 82.0, h - 33.0, w - cpu_left - 88.0, 24.0);
         let load = self.engine.cpu().clamp(0.0, 1.0);
         if load > 0.0 {
             let inner = mr.shrink(2.0);

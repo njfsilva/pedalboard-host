@@ -2,6 +2,7 @@
 //! from the .pdl patch XML, and the description the audio engine builds its plan from.
 
 use crate::builtins::{self, Builtin, Kind};
+use crate::engine::latency::NodeLatency;
 use crate::engine::{GraphDesc, MidiMap, NodeCell, NodeDesc, OscMap, StepKind, MIDI_PIN};
 use crate::pdl::{b64_decode, b64_encode, xml_from_binary, xml_to_binary, El};
 use crate::plugins::{self, PluginInfo, PluginUi};
@@ -35,7 +36,7 @@ pub enum NodeKind {
     Builtin(Builtin),
     Plugin(Box<dyn PluginUi>),
     /// A plugin that couldn't be loaded; its saved state is kept so saving doesn't lose it.
-    Missing(String),
+    Missing { state: String, program: i32 },
 }
 
 pub struct Node {
@@ -48,6 +49,8 @@ pub struct Node {
     pub outs: usize,
     /// The name the person gave the box (the patch's `UserNames`); empty for none.
     pub user_name: String,
+    /// Library preset selected on this instance, and the program it was loaded over.
+    pub user_preset: Option<(i32, String)>,
 }
 
 impl Node {
@@ -108,6 +111,17 @@ impl Node {
     pub fn bypassed(&self) -> bool {
         self.cell.bypass.load(Ordering::Relaxed)
     }
+    pub fn latency(&self) -> NodeLatency {
+        if self.bypassed() {
+            return NodeLatency::PassThrough { generates_audio: false };
+        }
+        match &self.kind {
+            NodeKind::Plugin(p) => NodeLatency::Process { samples: p.latency(), generates_audio: self.ins == 0 || self.info.is_instrument },
+            NodeKind::Builtin(b) if matches!(b.kind, Kind::Level | Kind::Looper) => NodeLatency::PassThrough { generates_audio: b.kind == Kind::Looper },
+            NodeKind::Builtin(_) => NodeLatency::Process { samples: 0, generates_audio: self.ins == 0 },
+            _ => NodeLatency::Silent,
+        }
+    }
     pub fn set_bypass(&self, on: bool) {
         self.cell.bypass.store(on, Ordering::Relaxed);
     }
@@ -148,8 +162,12 @@ impl Node {
     pub fn program(&self) -> i32 {
         match &self.kind {
             NodeKind::Plugin(p) => p.program(),
+            NodeKind::Missing { program, .. } => *program,
             _ => 0,
         }
+    }
+    pub fn user_preset_name(&self) -> Option<&str> {
+        self.user_preset.as_ref().filter(|(program, _)| *program == self.program()).map(|(_, name)| name.as_str())
     }
     fn step_kind(&self) -> StepKind {
         match self.kind {
@@ -168,12 +186,24 @@ impl Node {
                 let s = p.get_state();
                 (!s.is_empty()).then(|| b64_encode(&s))
             }
-            NodeKind::Missing(s) => (!s.is_empty()).then(|| s.clone()),
+            NodeKind::Missing { state, .. } => (!state.is_empty()).then(|| state.clone()),
             _ => None,
         }
     }
-    pub fn set_state_b64(&mut self, text: &str) -> bool {
+    fn restore_patch_state(&mut self, text: &str, program: i32) -> bool {
+        // Select the slot before applying the saved edits to it.
+        if let Some(p) = self.plugin() {
+            if (0..p.num_programs()).contains(&program) && p.program() != program {
+                p.set_program(program);
+            }
+        }
+        if text.is_empty() || self.is_io() || matches!(self.kind, NodeKind::Missing { .. }) {
+            return true;
+        }
         let Some(data) = b64_decode(text.trim()) else { return false };
+        if data.is_empty() {
+            return true;
+        }
         match &mut self.kind {
             NodeKind::Builtin(b) => match xml_from_binary(&data) {
                 Some(e) => {
@@ -182,7 +212,15 @@ impl Node {
                 }
                 None => false,
             },
-            NodeKind::Plugin(p) => p.set_state(&data),
+            NodeKind::Plugin(p) => {
+                if !p.set_state(&data) {
+                    return false;
+                }
+                if (0..p.num_programs()).contains(&program) && p.program() != program {
+                    p.select_program_after_state(program);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -283,7 +321,7 @@ impl Graph {
             MIDI_IN => (NodeKind::MidiIn, 0, 0),
             _ => (NodeKind::OscIn, 0, 0),
         };
-        Node { id, kind, info: internal_info(name, ins, outs), pos, cell: NodeCell::new(id, None), ins, outs, user_name: String::new() }
+        Node { id, kind, info: internal_info(name, ins, outs), pos, cell: NodeCell::new(id, None), ins, outs, user_name: String::new(), user_preset: None }
     }
 
     /// Adds or removes the I/O boxes to match the Misc Settings toggles. Returns removed nodes.
@@ -307,7 +345,7 @@ impl Graph {
         let (b, mut p) = builtins::create(kind);
         p.prepare(ctx.sample_rate, ctx.block);
         let (ins, outs) = kind.io();
-        Node { id, kind: NodeKind::Builtin(b), info: internal_info(kind.name(), ins, outs), pos, cell: NodeCell::new(id, Some(p)), ins, outs, user_name: String::new() }
+        Node { id, kind: NodeKind::Builtin(b), info: internal_info(kind.name(), ins, outs), pos, cell: NodeCell::new(id, Some(p)), ins, outs, user_name: String::new(), user_preset: None }
     }
 
     fn plugin_node(id: u32, info: &PluginInfo, pos: Pos2, ctx: &Ctx) -> Result<Node, String> {
@@ -316,7 +354,7 @@ impl Graph {
         let mut info = info.clone();
         info.num_inputs = l.ins as u32;
         info.num_outputs = l.outs as u32;
-        Ok(Node { id, kind: NodeKind::Plugin(l.ui), info, pos, cell: NodeCell::new(id, Some(l.proc_)), ins: l.ins, outs: l.outs, user_name: String::new() })
+        Ok(Node { id, kind: NodeKind::Plugin(l.ui), info, pos, cell: NodeCell::new(id, Some(l.proc_)), ins: l.ins, outs: l.outs, user_name: String::new(), user_preset: None })
     }
 
     pub fn add_builtin(&mut self, kind: Kind, pos: Pos2, ctx: &Ctx) -> u32 {
@@ -420,6 +458,9 @@ impl Graph {
         for n in &mut self.nodes {
             let mut f = El::new("FILTER").attr("uid", n.id).attr("x", n.pos.x.round()).attr("y", n.pos.y.round());
             f.set("program", n.program());
+            if let Some(name) = n.user_preset_name() {
+                f.set("userPreset", name);
+            }
             if n.bypassed() {
                 f.set("bypass", 1);
             }
@@ -482,6 +523,7 @@ impl Graph {
                 pos = pos2(pos.x * ctx.window.x, pos.y * ctx.window.y);
             }
             let state = f.child("STATE").map(|s| s.text.trim().to_string()).unwrap_or_default();
+            let program = i32::try_from(f.get_i("program", -1)).unwrap_or(-1);
             g.next_id = g.next_id.max(id + 1);
             let mut node = if info.format.eq_ignore_ascii_case("Internal") {
                 match info.name.as_str() {
@@ -515,18 +557,14 @@ impl Graph {
                     Err(e) => {
                         errors.push(format!("{}: {e}", info.name));
                         let (ins, outs) = (info.num_inputs as usize, info.num_outputs as usize);
-                        Node { id, kind: NodeKind::Missing(state.clone()), info, pos, cell: NodeCell::new(id, None), ins, outs, user_name: String::new() }
+                        Node { id, kind: NodeKind::Missing { state: state.clone(), program }, info, pos, cell: NodeCell::new(id, None), ins, outs, user_name: String::new(), user_preset: None }
                     }
                 }
             };
-            if !state.is_empty() && !matches!(node.kind, NodeKind::Missing(_)) {
-                node.set_state_b64(&state);
-            }
-            let prog = f.get_i("program", -1);
-            if let (true, Some(p)) = (prog >= 0, node.plugin()) {
-                if p.num_programs() > prog as i32 && p.program() != prog as i32 {
-                    p.set_program(prog as i32);
-                }
+            if node.restore_patch_state(&state, program) {
+                node.user_preset = f.get("userPreset").map(|name| (node.program(), name.to_owned()));
+            } else {
+                errors.push(format!("{} could not restore its saved settings.", node.name()));
             }
             node.set_bypass(f.get_b("bypass", false));
             g.nodes.push(node);
@@ -582,6 +620,78 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resaving_a_patch_with_an_unavailable_vst_keeps_its_program_preset_and_sound() {
+        let ctx = Ctx { sample_rate: 48000.0, block: 256, dev_ins: 2, dev_outs: 2, window: Vec2::ZERO, audio_in: false, midi_in: false, osc_in: false };
+        let patch = El::parse(r#"<Patch><FILTERGRAPH><FILTER uid="7" program="3" userPreset="Warm &amp; Wide">
+            <PLUGIN format="VST" file="Unavailable.dll"/><STATE>3.PIZa</STATE>
+            </FILTER></FILTERGRAPH></Patch>"#).unwrap();
+        let (mut graph, errors) = Graph::from_patch_el(&patch, &ctx);
+        assert_eq!(errors.len(), 1);
+        let saved = graph.to_patch_el("Song", 120.0);
+        let f = saved.child("FILTERGRAPH").unwrap().named("FILTER").find(|f| f.get("uid") == Some("7")).unwrap();
+        assert_eq!(f.get("userPreset"), Some("Warm & Wide"));
+        assert_eq!(f.get_i("program", 0), 3);
+        assert_eq!(f.child("STATE").unwrap().text, "3.PIZa");
+    }
+
+    #[test]
+    #[ignore = "requires FabFilter Pro-L 2, with PRO_L_VST3 pointing to the installed plug-in"]
+    fn vst3_patch_recalls_each_preset_with_edits_saved_before_the_next_audio_block() {
+        use crate::engine::{ProcessArgs, Transport};
+        use crate::presets::{Bar, Cache};
+        let path = std::path::PathBuf::from(std::env::var_os("PRO_L_VST3").expect("set PRO_L_VST3"));
+        let info = plugins::scan_file(&path).unwrap().remove(0);
+        let ctx = Ctx { sample_rate: 48000.0, block: 256, dev_ins: 2, dev_outs: 2, window: Vec2::ZERO, audio_in: false, midi_in: false, osc_in: false };
+        let dir = std::env::temp_dir().join(format!("pedalhost-vst3-recall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut graph = Graph::new_default(&ctx);
+        let mut expected = Vec::new();
+        for (name, value) in [("Quiet", 0.25), ("Loud", 0.75)] {
+            let id = graph.add_plugin(&info, Pos2::ZERO, &ctx).unwrap();
+            let n = graph.node_mut(id).unwrap();
+            let gain = (0..n.num_params()).find(|&i| n.param_name(i) == "Gain").unwrap();
+            let mut bar = Bar::default();
+            bar.fill(n, &dir);
+            n.set_param(gain, 0.5);
+            bar.text = name.to_owned();
+            bar.save(n, &dir).unwrap();
+            bar.relist(&dir);
+            let item = bar.items.iter().rposition(|s| s == name).unwrap();
+            bar.pick(n, item, &dir, &mut Cache::new()).unwrap();
+            n.set_param(gain, value);
+            expected.push((id, gain, name, value));
+        }
+        let saved = graph.to_patch_el("Song", 120.0).to_document();
+        drop(graph);
+        let (mut recalled, errors) = Graph::from_patch_el(&El::parse(&saved).unwrap(), &ctx);
+        assert!(errors.is_empty(), "{errors:?}");
+        for &(id, gain, name, value) in &expected {
+            let n = recalled.node_mut(id).unwrap();
+            let mut bar = Bar::default();
+            bar.fill(n, &dir);
+            assert_eq!(bar.text, name);
+            assert_eq!(bar.items[bar.ticked().unwrap()], name);
+            assert!((n.param_value(gain) - value).abs() < 0.0001, "{name}: recalled gain {}", n.param_value(gain));
+            let input = vec![0.0; ctx.block];
+            let mut output = vec![vec![0.0; ctx.block]; n.outs];
+            let inputs = vec![input.as_ptr(); n.ins];
+            let outputs: Vec<_> = output.iter_mut().map(|ch| ch.as_mut_ptr()).collect();
+            let transport = Transport { playing: true, tempo: 120.0, sample_pos: 0, sample_rate: ctx.sample_rate, num: 4, den: 4 };
+            // This isolated graph has no audio driver. Render a block to consume the restored edits.
+            unsafe { n.cell.processor().unwrap() }.process(&ProcessArgs { inputs: &inputs, outputs: &outputs, frames: ctx.block, midi_in: &[], transport: &transport });
+        }
+        let processed = recalled.to_patch_el("Song", 120.0);
+        drop(recalled);
+        let (recalled, errors) = Graph::from_patch_el(&processed, &ctx);
+        assert!(errors.is_empty(), "{errors:?}");
+        for (id, gain, name, value) in expected {
+            let n = recalled.node(id).unwrap();
+            assert!((n.param_value(gain) - value).abs() < 0.0001, "{name}: processed gain {}", n.param_value(gain));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn patch_keeps_box_names_and_nests_mappings_like_the_original() {

@@ -69,6 +69,10 @@ pub trait PluginUi {
     fn num_programs(&self) -> i32;
     fn program(&self) -> i32;
     fn set_program(&mut self, i: i32);
+    /// Some banks restore their own current slot. Align it with the patch's selection.
+    fn select_program_after_state(&mut self, i: i32) {
+        self.set_program(i);
+    }
     fn program_name(&self, i: i32) -> String;
     fn get_state(&mut self) -> Vec<u8>;
     fn set_state(&mut self, data: &[u8]) -> bool;
@@ -87,8 +91,8 @@ pub trait PluginUi {
     fn editor_open(&self) -> bool;
     fn close_editor(&mut self);
     fn set_editor_on_top(&mut self, _on: bool) {}
-    /// Called every UI frame: editor housekeeping and parameter echo from the audio thread.
-    fn idle(&mut self);
+    /// Services the editor and returns true when the latency display needs refreshing.
+    fn idle(&mut self) -> bool;
     fn latency(&self) -> u32;
 }
 

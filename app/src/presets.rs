@@ -250,6 +250,10 @@ pub fn migrate_legacy(old: &Path, new: &Path, known: &HashMap<String, String>) -
 
 /// What a bar works on: a box's plugin or built-in processor.
 pub trait Target {
+    fn user_preset_name(&self) -> Option<&str> {
+        None
+    }
+    fn set_user_preset(&mut self, _name: Option<String>) {}
     fn num_programs(&self) -> i32;
     fn program(&self) -> i32;
     fn set_program(&mut self, k: i32);
@@ -262,6 +266,12 @@ pub trait Target {
 }
 
 impl Target for Node {
+    fn user_preset_name(&self) -> Option<&str> {
+        Node::user_preset_name(self)
+    }
+    fn set_user_preset(&mut self, name: Option<String>) {
+        self.user_preset = name.map(|name| (self.program(), name));
+    }
     fn num_programs(&self) -> i32 {
         match &self.kind {
             NodeKind::Plugin(p) => p.num_programs().max(0),
@@ -376,7 +386,10 @@ impl Bar {
         self.items = (0..np).map(|k| listed(t, k)).collect();
         self.items.extend(list(dir));
         self.seen = t.program();
-        if np > 0 {
+        if let Some(name) = t.user_preset_name() {
+            self.current = self.items[self.programs..].iter().position(|p| p == name).map_or(0, |i| self.programs + i + 1);
+            self.text = name.to_owned();
+        } else if np > 0 {
             let k = t.program().clamp(0, np - 1) as usize;
             self.current = k + 1;
             self.text = self.items[k].clone();
@@ -413,6 +426,7 @@ impl Bar {
             if let Some(s) = kept {
                 t.set_program_state(&s)?;
             }
+            t.set_user_preset(None);
             return Ok(true);
         }
         let d = std::fs::read(preset_path(dir, &name)).map_err(|e| format!("Could not read the preset \"{name}\": {e}"))?;
@@ -437,6 +451,7 @@ impl Bar {
         // A plugin may move to another program number with the preset; the preset stays ticked.
         self.seen = t.program();
         self.current = idx + 1;
+        t.set_user_preset(Some(name.clone()));
         self.text = name;
         Ok(true)
     }
@@ -458,6 +473,7 @@ impl Bar {
         self.items[i] = now;
         if self.items[i] == self.text {
             self.current = i + 1;
+            t.set_user_preset(None);
         }
         changed
     }
@@ -484,6 +500,7 @@ impl Bar {
     pub fn import(&mut self, t: &mut dyn Target, file: &Path) -> Result<(), String> {
         let d = std::fs::read(file).map_err(|e| format!("Could not read {}: {e}", file.display()))?;
         t.set_program_state(&d)?;
+        t.set_user_preset(None);
         let k = t.program();
         self.seen = k;
         if let Some(i) = self.program_item(k) {
@@ -698,7 +715,7 @@ impl App {
     /// A program was chosen somewhere other than the bar.
     pub fn sync_bar(&mut self, id: u32) {
         let (Some(n), Some(slot)) = (self.graph.node(id), self.preset_bars.get_mut(&id)) else { return };
-        slot.bar.follow(n);
+        slot.bar.fill(n, &folder(&n.info));
         show(n, &slot.bar);
     }
 
@@ -707,10 +724,14 @@ impl App {
     pub fn bar_events(&mut self) {
         let mut todo = Vec::new();
         for (&id, slot) in self.preset_bars.iter_mut() {
-            let Some(n) = self.graph.node(id) else { continue };
+            let Some(n) = self.graph.node_mut(id) else { continue };
+            let changed = slot.bar.follow(n);
+            if changed {
+                n.user_preset = None;
+            }
             if let NodeKind::Plugin(p) = &n.kind {
                 if let Some(w) = p.editor_window() {
-                    if slot.bar.follow(n) {
+                    if changed {
                         w.set_bar(&slot.bar.items, slot.bar.ticked(), &slot.bar.text);
                     }
                     todo.extend(w.take_bar_events().into_iter().map(|e| (id, e)));

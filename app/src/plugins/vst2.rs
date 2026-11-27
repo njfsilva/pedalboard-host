@@ -10,7 +10,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MAGIC: i32 = 0x5673_7450; // 'VstP'
 
@@ -155,6 +155,8 @@ struct ERect {
 struct HostData {
     sample_rate: AtomicU64,
     block: AtomicU32,
+    channels: OnceLock<(i32, i32)>,
+    latency_samples: AtomicU32,
     editor: AtomicIsize,
     shell_id: i32,
     /// Written by the audio thread right before each process call.
@@ -171,6 +173,8 @@ impl HostData {
         Box::new(HostData {
             sample_rate: AtomicU64::new(sr.to_bits()),
             block: AtomicU32::new(block as u32),
+            channels: OnceLock::new(),
+            latency_samples: AtomicU32::new(0),
             editor: AtomicIsize::new(0),
             shell_id,
             time: UnsafeCell::new(TimeInfo::default()),
@@ -235,6 +239,14 @@ unsafe extern "C" fn host_callback(effect: *mut AEffect, opcode: i32, index: i32
         }
         // processEvents (MIDI sent by the plugin isn't routed onwards)
         8 => 0,
+        // audioMasterIOChanged also signals a new initialDelay with the same channel layout.
+        13 => host.map_or(0, |h| {
+            if h.channels.get().is_some_and(|&layout| layout != ((*effect).num_inputs, (*effect).num_outputs)) {
+                return 0;
+            }
+            h.latency_samples.store((*effect).initial_delay.max(0) as u32, Relaxed);
+            1
+        }),
         // sizeWindow
         15 => {
             if let Some(h) = host {
@@ -379,7 +391,12 @@ impl Inst {
         self.call(EFF_SET_BLOCK_SIZE, 0, block as isize, null_mut(), 0.0);
         self.call(EFF_MAINS_CHANGED, 0, 1, null_mut(), 0.0);
         self.call(EFF_START_PROCESS, 0, 0, null_mut(), 0.0);
+        self.publish_latency();
         self.running.store(true, Relaxed);
+    }
+
+    fn publish_latency(&self) {
+        self.host.latency_samples.store(self.fx().initial_delay.max(0) as u32, Relaxed);
     }
 
     fn describe(&self, path: &Path, shell_name: Option<String>) -> PluginInfo {
@@ -495,6 +512,7 @@ pub fn load(info: &PluginInfo, sr: f64, block: usize) -> Result<Loaded, String> 
         return Err("The plugin has no audio processing.".into());
     }
     inst.start(sr, block);
+    let _ = inst.host.channels.set((fx.num_inputs, fx.num_outputs));
     let ins = fx.num_inputs.clamp(0, 64) as usize;
     let outs = fx.num_outputs.clamp(0, 64) as usize;
     let mut name = info.name.clone();
@@ -630,6 +648,8 @@ impl Processor for V2Proc {
                 p(self.inst.e, self.in_ptrs.as_mut_ptr(), self.out_ptrs.as_mut_ptr(), n as i32);
             }
         }
+        // Some VST2 effects update initialDelay without sending audioMasterIOChanged.
+        self.inst.publish_latency();
         for i in outs..a.outputs.len() {
             a.output(i).fill(0.0);
         }
@@ -841,7 +861,10 @@ impl PluginUi for V2Ui {
         if fx.flags & FLAG_PROGRAM_CHUNKS != 0 {
             let mut ptr: *mut c_void = null_mut();
             let size = self.inst.call(EFF_GET_CHUNK, 0, 0, &mut ptr as *mut *mut c_void as *mut c_void, 0.0);
-            let chunk: &[u8] = if size > 0 && !ptr.is_null() { unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) } } else { &[] };
+            if size <= 0 || ptr.is_null() {
+                return self.program_state();
+            }
+            let chunk = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) };
             v.extend_from_slice(b"FBCh");
             v.extend_from_slice(&1i32.to_be_bytes());
             v.extend_from_slice(&uid.to_be_bytes());
@@ -945,16 +968,18 @@ impl PluginUi for V2Ui {
     /// chunks, otherwise an 'FxCk' list of the program's parameters.
     fn program_state(&mut self) -> Vec<u8> {
         let fx = self.inst.fx();
-        if fx.flags & FLAG_PROGRAM_CHUNKS == 0 {
-            let mut v = Vec::new();
-            self.program_block(&mut v);
-            return v;
+        if fx.flags & FLAG_PROGRAM_CHUNKS != 0 {
+            let name = self.inst.text(EFF_GET_PROGRAM_NAME, 0);
+            let mut ptr: *mut c_void = null_mut();
+            let size = self.inst.call(EFF_GET_CHUNK, 1, 0, &mut ptr as *mut *mut c_void as *mut c_void, 0.0);
+            if size > 0 && !ptr.is_null() {
+                let chunk = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) };
+                return crate::presets::fpch(&name, fx.unique_id, fx.version, fx.num_programs.max(0), chunk);
+            }
         }
-        let mut ptr: *mut c_void = null_mut();
-        let size = self.inst.call(EFF_GET_CHUNK, 1, 0, &mut ptr as *mut *mut c_void as *mut c_void, 0.0);
-        let chunk: &[u8] = if size > 0 && !ptr.is_null() { unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) } } else { &[] };
-        let name = self.inst.text(EFF_GET_PROGRAM_NAME, 0);
-        crate::presets::fpch(&name, fx.unique_id, fx.version, fx.num_programs.max(0), chunk)
+        let mut params = Vec::new();
+        self.program_block(&mut params);
+        params
     }
 
     /// As JUCE's changeProgramName: only the current program, at most 24 bytes.
@@ -1063,14 +1088,15 @@ impl PluginUi for V2Ui {
         }
     }
 
-    fn idle(&mut self) {
+    fn idle(&mut self) -> bool {
         if self.editor.as_ref().is_some_and(|w| w.closed()) {
             self.close_editor();
         }
+        false
     }
 
     fn latency(&self) -> u32 {
-        self.inst.fx().initial_delay.max(0) as u32
+        self.inst.host.latency_samples.load(Relaxed)
     }
 }
 
