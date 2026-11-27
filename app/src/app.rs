@@ -475,6 +475,8 @@ impl App {
         self.field.selected.clear();
         self.field.stop_rename();
         self.field.close_popups();
+        self.field.request_fit();
+        self.egui_ctx.request_repaint();
         // switchPatch (0x140039720) clears the field's hint after loading a stored patch.
         if stored {
             self.field.hide_hint();

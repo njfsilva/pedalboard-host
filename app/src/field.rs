@@ -19,6 +19,7 @@ const PIN_STEP: f32 = 12.0;
 /// and its centre is half a 12 px pin lower (0x140074e40).
 const PIN0: f32 = 1.0 + 25.0 + 6.0;
 const SB: f32 = 18.0;
+const EDGE_SPACE: f32 = 10.0;
 const BTN: f32 = 16.0;
 
 pub enum Action {
@@ -95,6 +96,8 @@ const PROGRAMS_LIST: &str = "box_menu_programs";
 #[derive(Default)]
 pub struct Field {
     pub scroll: Vec2,
+    fit_pending: bool,
+    fit_scale: Option<f32>,
     pub selected: Vec<(u32, u32, u32, u32)>,
     wire: Option<Pin>,
     /// The open menu, and the rectangles it covered when last drawn (the menu, then its list).
@@ -229,6 +232,34 @@ fn count_press(history: &mut Vec<Press>, now: Press) -> usize {
 }
 
 impl Field {
+    pub fn request_fit(&mut self) {
+        self.fit_pending = true;
+        self.wire = None;
+    }
+
+    /// Fit once per patch, after fonts and channel labels have determined every box's size.
+    fn fit_patch(&mut self, ctx: &Context, bounds: Rect, view: Vec2) {
+        if Rect::from_min_size(self.scroll.to_pos2(), view).contains_rect(bounds) {
+            self.fit_scale = None;
+            return;
+        }
+        let padded = bounds.expand(EDGE_SPACE);
+        let first = padded.min.to_vec2().max(Vec2::ZERO);
+        self.scroll = self.scroll.clamp(Vec2::ZERO, first);
+        let end = bounds.max.to_vec2() - self.scroll;
+        let growth = vec2(
+            if end.x > view.x { end.x - view.x + EDGE_SPACE } else { 0.0 },
+            if end.y > view.y { end.y - view.y + EDGE_SPACE } else { 0.0 },
+        );
+        let room = view + crate::subwin::grow_main(ctx, growth);
+        // If the monitor limits growth, use any blank space before the first box, then
+        // scale only the board if its boxes still cannot all fit at their natural size.
+        let span = (padded.max.to_vec2() - first).max(Vec2::splat(1.0));
+        let scale = if end.x <= room.x && end.y <= room.y { 1.0 } else { (room / span).min_elem().min(1.0) };
+        self.fit_scale = (scale < 1.0).then_some(scale);
+        self.scroll = self.scroll.max(padded.max.to_vec2() - room / scale).min(first);
+    }
+
     /// Drops an unfinished rename, e.g. when another patch replaces the boxes.
     pub fn stop_rename(&mut self) {
         self.rename = None;
@@ -255,19 +286,39 @@ impl Field {
     #[allow(clippy::too_many_arguments)]
     pub fn show(&mut self, ui: &mut Ui, field: Rect, g: &mut Graph, c: &Scheme, plugins: &[PluginInfo]) -> Vec<Action> {
         let mut act = Vec::new();
-        let vp = Rect::from_min_max(field.min, field.max - vec2(SB, SB));
+        let screen_view = Rect::from_min_max(field.min, field.max - vec2(SB, SB));
         let id = Id::new("pedal_field");
         let sizes: Vec<Vec2> = g.nodes.iter().map(|n| box_size(ui, n)).collect();
-        // The field is a little taller than its view, so both scrollbars always show.
-        let mut content = vec2(field.width(), field.height() + 23.0);
-        for (n, s) in g.nodes.iter().zip(&sizes) {
-            content = content.max(n.pos.to_vec2() + *s + vec2(10.0, 10.0));
+        let bounds = g.nodes.iter().zip(&sizes).fold(Rect::NOTHING, |r, (n, s)| r.union(Rect::from_min_size(n.pos, *s)));
+        let start = bounds.min.to_vec2().min(Vec2::ZERO);
+        let bounds = bounds.translate(-start);
+        if self.fit_pending && screen_view.is_positive() && !ui.input(|i| i.viewport().minimized == Some(true)) {
+            self.fit_pending = false;
+            if bounds.is_finite() {
+                self.fit_patch(ui.ctx(), bounds, screen_view.size());
+            } else {
+                self.fit_scale = None;
+                self.scroll = Vec2::ZERO;
+            }
         }
+        let scale = self.fit_scale.unwrap_or(1.0);
+        let to_screen = emath::TSTransform::new(screen_view.min.to_vec2() * (1.0 - scale), scale);
+        let from_screen = to_screen.inverse();
+        let vp = from_screen * screen_view;
+        // The field is a little taller than its view, so both scrollbars always show.
+        let content = (vec2(field.width(), field.height() + 23.0) / scale).max(bounds.max.to_vec2() + Vec2::splat(EDGE_SPACE));
         self.scroll = self.scroll.clamp(Vec2::ZERO, (content - vp.size()).max(Vec2::ZERO));
-        let origin = vp.min - self.scroll;
+        let origin = vp.min - self.scroll - start;
         let rects: Vec<Rect> = g.nodes.iter().zip(&sizes).map(|(n, s)| Rect::from_min_size(origin + n.pos.to_vec2(), *s)).collect();
 
-        let mut fu = ui.new_child(UiBuilder::new().max_rect(vp).id_salt("field_ui"));
+        let mut builder = UiBuilder::new().max_rect(vp).id_salt("field_ui");
+        if scale != 1.0 {
+            let layer = LayerId::new(ui.layer_id().order, id.with("scaled"));
+            ui.ctx().set_sublayer(ui.layer_id(), layer);
+            ui.ctx().set_transform_layer(layer, to_screen);
+            builder = builder.layer_id(layer);
+        }
+        let mut fu = ui.new_child(builder);
         fu.set_clip_rect(vp);
         let bg = fu.interact(vp, id.with("bg"), Sense::click());
         let p = fu.painter().clone();
@@ -291,7 +342,7 @@ impl Field {
 
         // Cables are added after the boxes they join (0x14007dd40, 0x140080500), so they draw on top
         // of the boxes and take the pointer where they cross one.
-        let pointer = fu.input(|i| i.pointer.hover_pos());
+        let pointer = fu.input(|i| i.pointer.hover_pos()).map(|pos| from_screen * pos);
         let busy = self.wire.is_some() || fu.ctx().dragged_id().is_some();
         let rect_of = |id: u32| g.nodes.iter().position(|n| n.id == id).map(|i| rects[i]);
         let mut hovered_cable = None;
@@ -336,16 +387,17 @@ impl Field {
                     // none. The field's own menus count where they were last drawn, as egui still
                     // lists a closed one for a frame, and presses go through tooltips, like the
                     // original's.
-                    let on_field = vp.contains(pos)
+                    let on_field = screen_view.contains(pos)
                         && !on_menu
-                        && fu.ctx().layer_id_at(pos).is_none_or(|l| l == field_layer || l.order == Order::Tooltip || own_menus.contains(&l.id));
+                        && fu.ctx().layer_id_at(pos).is_none_or(|l| l == field_layer || l == ui.layer_id() || l.order == Order::Tooltip || own_menus.contains(&l.id));
                     let clicks = count_press(&mut self.presses, Press { pos, time: now, button, on_field });
-                    let target = if on_field { target_at(pos) } else { Target::Empty };
+                    let local = from_screen * pos;
+                    let target = if on_field { target_at(local) } else { Target::Empty };
                     let secondary = button == PointerButton::Secondary;
                     if on_field && target == Target::Empty && (clicks == 2 || secondary) {
                         // The new box's top-left goes on the press, in whole field pixels: addFilter
                         // (0x14002c6b0) stores the event's int x and y, and 0x14007b550 places the box there.
-                        self.open(Popup::Add { screen: pos, at: (pos - origin).to_pos2().floor() });
+                        self.open(Popup::Add { screen: pos, at: (local - origin).to_pos2().floor() });
                     }
                     if secondary {
                         self.right_press = match target {
@@ -375,7 +427,7 @@ impl Field {
             let under_cable = hovered_cable.is_some() && pointer.is_some_and(|m| r.contains(m));
             let resp = fu.interact(r, id.with(("box", nid)), if under_cable { Sense::hover() } else { Sense::click_and_drag() });
             if resp.dragged() {
-                n.pos = (n.pos + resp.drag_delta()).max(Pos2::ZERO);
+                n.pos = (n.pos + resp.drag_delta()).max(start.to_pos2());
             }
             if resp.drag_stopped() {
                 act.push(Action::Moved);
@@ -522,7 +574,7 @@ impl Field {
             self.rename = None;
         }
         if let Some(w) = self.wire {
-            let m = fu.input(|i| i.pointer.interact_pos()).unwrap_or(w.at);
+            let m = fu.input(|i| i.pointer.interact_pos()).map_or(w.at, |pos| from_screen * pos);
             let target = pins.iter().filter(|q| q.out != w.out && q.param == w.param && q.node != w.node).min_by(|a, b| a.at.distance(m).total_cmp(&b.at.distance(m))).filter(|q| q.at.distance(m) < 14.0).copied();
             let end = target.map(|t| t.at).unwrap_or(m);
             let pts = if w.out { cable(w.at, end) } else { cable(end, w.at) };
@@ -555,15 +607,15 @@ impl Field {
         let modal = fu.ctx().memory(|m| m.top_modal_layer().is_some()) || crate::subwin::modal();
         if pointer.is_some_and(|m| vp.contains(m)) && !modal {
             let d = fu.input(|i| i.smooth_scroll_delta);
-            self.scroll -= d;
+            self.scroll -= d / scale;
         }
 
         let max = (content - vp.size()).max(Vec2::ZERO);
-        let vbar = Rect::from_min_max(pos2(vp.right(), field.top()), pos2(field.right(), vp.bottom()));
-        let hbar = Rect::from_min_max(pos2(field.left(), vp.bottom()), pos2(vp.right(), field.bottom()));
+        let vbar = Rect::from_min_max(pos2(screen_view.right(), field.top()), pos2(field.right(), screen_view.bottom()));
+        let hbar = Rect::from_min_max(pos2(field.left(), screen_view.bottom()), pos2(screen_view.right(), field.bottom()));
         scrollbar(ui, vbar, true, &mut self.scroll.y, vp.height(), vp.height() + max.y, id.with("vs"));
         scrollbar(ui, hbar, false, &mut self.scroll.x, vp.width(), vp.width() + max.x, id.with("hs"));
-        ui.painter().rect_filled(Rect::from_min_max(vp.max, field.max), CornerRadius::ZERO, c.get(colours::WINDOW_BG));
+        ui.painter().rect_filled(Rect::from_min_max(screen_view.max, field.max), CornerRadius::ZERO, c.get(colours::WINDOW_BG));
 
         self.popups_ui(ui.ctx(), g, plugins, &mut act);
         act
@@ -859,6 +911,31 @@ mod tests {
 
     fn renamed(acts: &[Action]) -> bool {
         acts.iter().any(|a| matches!(a, Action::Renamed))
+    }
+
+    #[test]
+    fn fitting_an_oversize_patch_keeps_the_last_box_visible_and_clickable() {
+        let mut rig = Rig::new();
+        let pos = pos2(2200.0, 1100.0);
+        let id = rig.g.add_builtin(Kind::Level, pos, &gctx());
+        rig.field.request_fit();
+        rig.frame(vec![]);
+        let scale = rig.field.fit_scale.unwrap();
+        assert!(scale < 1.0);
+        let corner = rig.field_r.min + (pos.to_vec2() - rig.field.scroll) * scale;
+        let size = builtin_box(0.0, Kind::Level.control_size());
+        let visible = Rect::from_min_max(rig.field_r.min, rig.field_r.max - Vec2::splat(SB));
+        assert!(visible.contains_rect(Rect::from_min_size(corner, size * scale)));
+        let editor = corner + vec2(21.0, size.y - 20.0) * scale;
+        assert!(rig.click(editor, PointerButton::Primary).iter().any(|a| matches!(a, Action::OpenEditor(n) if *n == id)));
+
+        rig.g.remove(id);
+        rig.g.nodes.iter_mut().find(|n| n.name() == AUDIO_OUT).unwrap().pos = pos2(500.0, 10.0);
+        rig.field.scroll = vec2(1300.0, 800.0);
+        rig.field.request_fit();
+        rig.frame(vec![]);
+        assert_eq!(rig.field.fit_scale, None);
+        assert_eq!(rig.field.scroll, Vec2::ZERO);
     }
 
     #[test]

@@ -540,6 +540,36 @@ pub fn work_size(ctx: &Context) -> Vec2 {
     work_area(main_hwnd(), ctx.pixels_per_point()).map_or(ctx.screen_rect().size(), |w| w.size())
 }
 
+/// Grow the main window just enough to reveal a patch, keeping its frame on its monitor.
+/// Returns the extra room available to the canvas after the resize.
+pub fn grow_main(ctx: &Context, growth: Vec2) -> Vec2 {
+    if growth == Vec2::ZERO {
+        return Vec2::ZERO;
+    }
+    let (outer, inner, monitor, fixed) = ctx.input(|i| {
+        let v = i.viewport();
+        (v.outer_rect, v.inner_rect, v.monitor_size, v.maximized == Some(true) || v.fullscreen == Some(true))
+    });
+    if fixed {
+        return Vec2::ZERO;
+    }
+    let current = ctx.screen_rect().size();
+    let Some(work) = work_area(main_hwnd(), ctx.pixels_per_point())
+        .or_else(|| monitor.map(|size| Rect::from_min_size(Pos2::ZERO, size))) else { return Vec2::ZERO };
+    let frame = outer.zip(inner).map_or(FRAME_GUESS, |(o, i)| (o.size() - i.size()).max(Vec2::ZERO));
+    let target = (current + growth.ceil()).min((work.size() - frame).floor()).max(current);
+    if target != current {
+        if let Some(outer) = outer {
+            let pos = clamp_pos(outer.min, target + frame, work);
+            if pos != outer.min {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            }
+        }
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+    }
+    target - current
+}
+
 fn owner_ppp(ctx: &Context, owner: ViewportId) -> f32 {
     let p = if owner == ViewportId::ROOT { 0.0 } else { SLOTS.with(|s| s.borrow().get(&owner).map_or(0.0, |v| v.ppp)) };
     if p > 0.0 {
