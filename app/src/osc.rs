@@ -79,6 +79,7 @@ impl Server {
                         let _ = to_ui.send(Incoming::Osc { address: m.address, tags: m.tags, args: m.args });
                     }
                     ctx.request_repaint();
+                    crate::tray::wake();
                 }
             })
             .map_err(|e| e.to_string())?;

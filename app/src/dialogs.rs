@@ -8,6 +8,7 @@ use crate::engine::{asio, wasapi};
 use crate::graph::NodeKind;
 use crate::plugins::PluginUi;
 use crate::settings::{self, AppCommand, AppMapping, AudioConfig, Settings};
+use crate::subwin::{self, Kind, Spec};
 use crate::widgets::{bold, font, scrollbar, text_at, text_fit};
 use egui::color_picker::{color_edit_button_srgba, Alpha};
 use egui::*;
@@ -38,6 +39,8 @@ pub struct AppMapDraft {
 #[derive(Default)]
 pub struct Dialogs {
     pub messages: Vec<(String, String)>,
+    /// Counts the messages answered, so each one opens as a new window in the middle.
+    pub message_no: u32,
     pub confirm: Option<Cmd>,
     pub misc: bool,
     /// The Misc Settings text boxes (OSC port, multicast address) while the window is open.
@@ -61,8 +64,8 @@ pub struct Dialogs {
     pub log: bool,
     pub about: bool,
     pub docs: bool,
-    /// Editor windows drawn inside the main window (built-ins, plugins without an editor of their
-    /// own), by box id, and the one to bring to the front this frame.
+    /// Editor windows the app draws (built-ins, plugins without an editor of their own), by box
+    /// id, and the one to bring to the front this frame.
     pub editors: Vec<u32>,
     pub raise: Option<u32>,
 }
@@ -139,10 +142,6 @@ pub fn apply_style(ctx: &Context, c: &Scheme) {
     st.spacing.button_padding = vec2(8.0, 3.0);
     st.spacing.item_spacing = vec2(8.0, 6.0);
     ctx.set_style(st);
-}
-
-fn dialog(title: &str) -> Window<'_> {
-    Window::new(title).collapsible(false).resizable(true)
 }
 
 /// JUCE's generic plugin editor: 25 px rows, scrolled past 400 px with an 18 px bar.
@@ -240,15 +239,9 @@ fn commit_osc_text(s: &mut Settings, port: &mut String, group: &mut String) {
 }
 
 impl App {
+    /// The app's own windows, each a desktop window of its own, shown every pass while open.
+    /// A window's lists and prompts come after it, as they belong to it.
     pub fn windows(&mut self, ctx: &Context) {
-        // The organiser's "Select patch..." box and the preset manager's prompts go first so their
-        // Enter and Escape reach them before any window under them reads them.
-        if self.dlg.import.is_some() {
-            self.import_window(ctx);
-        }
-        if self.dlg.presets.as_ref().is_some_and(|m| m.prompting()) {
-            self.preset_prompt(ctx);
-        }
         self.editor_windows(ctx);
         self.message_window(ctx);
         self.confirm_window(ctx);
@@ -270,8 +263,18 @@ impl App {
         if self.dlg.organiser {
             self.organiser_window(ctx);
         }
+        // The organiser's "Select patch..." box belongs to it and closes with it.
+        if !self.dlg.organiser {
+            self.dlg.import = None;
+        }
+        if self.dlg.import.is_some() {
+            self.import_window(ctx);
+        }
         if self.dlg.presets.is_some() {
             self.presets_window(ctx);
+        }
+        if self.dlg.presets.as_ref().is_some_and(|m| m.prompting()) {
+            self.preset_prompt(ctx);
         }
         if self.dlg.mappings.is_some() {
             self.mappings_window(ctx);
@@ -282,18 +285,29 @@ impl App {
         if self.dlg.about || self.dlg.docs {
             self.info_windows(ctx);
         }
+        // While a prompt is up, the main window and the window that asked can't be used, as
+        // with the original's modal AlertWindow.
+        let mut blocked = Vec::new();
+        if self.dlg.import.is_some() && subwin::shown(crate::editors::import_vid()) {
+            blocked = vec![ViewportId::ROOT, self.organiser_vid()];
+        }
+        if let Some(m) = self.dlg.presets.as_ref().filter(|m| m.prompting() && subwin::shown(crate::editors::prompt_vid(m))) {
+            blocked = vec![ViewportId::ROOT, crate::editors::presets_vid(m)];
+        }
+        subwin::end_frame(ctx, &blocked);
     }
 
-    /// Editor windows for built-ins and for plugins without an editor of their own, inside the main
-    /// window. They keep their editor's size unless Misc Settings allow resizing windows.
+    /// Editor windows for built-ins and for plugins without an editor of their own. They keep
+    /// their editor's size unless Misc Settings allow resizing windows.
     fn editor_windows(&mut self, ctx: &Context) {
         if self.dlg.editors.is_empty() {
             return;
         }
         let c = self.scheme.clone();
         let fixed = self.settings.fixed_size_windows;
+        let on_top = self.settings.windows_on_top;
         let raise = self.dlg.raise.take();
-        let bar_h = crate::presets::BAR_H as f32;
+        let (bar_w, bar_h) = (crate::presets::BAR_W as f32, crate::presets::BAR_H as f32);
         let mut keep = Vec::new();
         let mut events = Vec::new();
         for nid in std::mem::take(&mut self.dlg.editors) {
@@ -312,31 +326,29 @@ impl App {
                 s
             });
             slot.bar.follow(n);
+            let vid = subwin::id(("editor", nid));
             let wid = Id::new(("editor", nid));
-            let mut open = true;
-            Window::new(n.title().to_string())
-                .id(wid)
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(!fixed)
-                .default_size(size)
-                .min_size(vec2(crate::presets::BAR_W as f32, bar_h))
-                .frame(Frame::window(&ctx.style()).inner_margin(Margin::ZERO))
-                .show(ctx, |ui| {
-                    let want = if fixed { size } else { ui.available_size().max(vec2(crate::presets::BAR_W as f32, bar_h)) };
-                    let (r, _) = ui.allocate_exact_size(want, Sense::hover());
-                    let (top, r) = r.split_top_bottom_at_y(r.top() + bar_h);
-                    events.extend(crate::presets::bar_ui(ui, top, wid.with("bar"), slot, &c).into_iter().map(|e| (nid, e)));
-                    match &mut n.kind {
-                        NodeKind::Builtin(b) => b.editor_ui(ui, r, wid.with("body"), &c),
-                        NodeKind::Plugin(p) => generic_editor(ui, r, wid.with("body"), p.as_mut()),
-                        _ => {}
-                    }
-                });
+            let title = n.title().to_string();
+            let spec = Spec::new(vid, &title, Kind::fill(size, vec2(bar_w, bar_h), !fixed)).margin(Margin::ZERO).auto().on_top(on_top);
+            let close = subwin::show(ctx, spec, |ui| {
+                let want = if fixed { size } else { ui.available_size().max(vec2(bar_w, bar_h)) };
+                let (r, _) = ui.allocate_exact_size(want, Sense::hover());
+                let (top, r) = r.split_top_bottom_at_y(r.top() + bar_h);
+                events.extend(crate::presets::bar_ui(ui, top, wid.with("bar"), slot, &c).into_iter().map(|e| (nid, e)));
+                match &mut n.kind {
+                    NodeKind::Builtin(b) => b.editor_ui(ui, r, wid.with("body"), &c),
+                    NodeKind::Plugin(p) => generic_editor(ui, r, wid.with("body"), p.as_mut()),
+                    _ => {}
+                }
+            });
+            // The bar's list of presets opens under it as a window of its own.
+            events.extend(crate::presets::bar_list(ctx, subwin::id(("editor_list", nid)), vid, slot, &c).map(|e| (nid, e)));
             if raise == Some(nid) {
-                ctx.move_to_top(LayerId::new(Order::Middle, wid));
+                subwin::focus(ctx, vid);
             }
-            if open {
+            if close {
+                slot.dd.close();
+            } else {
                 keep.push(nid);
             }
         }
@@ -346,39 +358,67 @@ impl App {
         }
     }
 
-    fn message_window(&mut self, ctx: &Context) {
-        let Some((title, text)) = self.dlg.messages.first().cloned() else { return };
-        let mut ok = false;
-        dialog(&title).id(Id::new("message")).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.label(&text);
-            ui.add_space(6.0);
-            ok = ui.button("  OK  ").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
-        });
-        if ok {
-            self.dlg.messages.remove(0);
+    /// Help > Documentation, as in the original (its case at 0x140038f08): the page
+    /// "documentation/index.html" beside the program opens in the default browser. Where that page
+    /// isn't there, the original says "Documentation Missing"; the rebuild ships no such page, so it
+    /// shows its own short guide instead.
+    pub fn open_documentation(&mut self) {
+        let exe = std::env::current_exe().ok();
+        if !docs_page(exe.as_deref()).is_some_and(|page| open_in_browser(&page)) {
+            self.dlg.docs = true;
         }
     }
 
+    fn message_window(&mut self, ctx: &Context) {
+        let Some((title, text)) = self.dlg.messages.first().cloned() else { return };
+        let mut ok = false;
+        let spec = Spec::new(subwin::id(("message", self.dlg.message_no)), &title, Kind::fit_between(300.0, 460.0));
+        let close = subwin::show(ctx, spec, |ui| {
+            ui.label(&text);
+            ui.add_space(6.0);
+            // The original's plain box has one button, "ok" (showMessageBox 0x140218bd0, text at
+            // 0x140425664), and it takes Return and Escape (createAlertWindow, 0x1401e4050).
+            ok |= ui.button("   ok   ").clicked() || ui.input(|i| i.modifiers.is_none() && (i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape)));
+        });
+        if ok || close {
+            self.dlg.messages.remove(0);
+            self.dlg.message_no += 1;
+        }
+    }
+
+    /// The original's "Closing document..." box (FileBasedDocument::saveIfNeededAndUserAgrees,
+    /// 0x1402324e0, through AlertWindow::showYesNoCancelBox, 0x140219400). Its keys come from
+    /// createAlertWindow (0x1401e4050): S saves, D discards, Escape or the close button cancels,
+    /// and Return does nothing.
     fn confirm_window(&mut self, ctx: &Context) {
         let Some(cmd) = self.dlg.confirm else { return };
-        let name = self.file.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "this file".into());
+        let name = doc_title(self.file.as_deref());
         let mut answer = None;
-        dialog("Unsaved changes").resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(format!("Do you want to save the changes to {name}?"));
+        let spec = Spec::new(subwin::id("confirm"), "Closing document...", Kind::fit_between(300.0, 460.0));
+        let close = subwin::show(ctx, spec, |ui| {
+            ui.label(format!("Do you want to save the changes to \"{name}\"?"));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button("save").clicked() {
                     answer = Some(0);
                 }
-                if ui.button("Discard changes").clicked() {
+                if ui.button("discard changes").clicked() {
                     answer = Some(1);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("cancel").clicked() {
                     answer = Some(2);
                 }
             });
+            let key = ui.input(|i| {
+                let k = |key| i.modifiers.is_none() && i.key_pressed(key);
+                [(Key::S, 0), (Key::D, 1), (Key::Escape, 2)].into_iter().find(|(key, _)| k(*key)).map(|(_, a)| a)
+            });
+            answer = answer.or(key);
         });
+        // Closing the box is the same as Cancel.
+        if close && answer.is_none() {
+            answer = Some(2);
+        }
         match answer {
             Some(0) => {
                 self.dlg.confirm = None;
@@ -400,12 +440,12 @@ impl App {
     /// each control's place (resized, 0x140085670), its labels (the window's constructor,
     /// 0x140081dc0) and the framed panel behind the I/O switches (paint, 0x140085450).
     fn misc_window(&mut self, ctx: &Context) {
-        let mut open = true;
         let before = self.settings.clone();
         let (port_text, group_text) = self.dlg.misc_text.get_or_insert_with(|| (before.osc_port.to_string(), before.osc_multicast.clone()));
         let s = &mut self.settings;
         let c = &self.scheme;
-        dialog("Misc Settings").open(&mut open).resizable(false).show(ctx, |ui| {
+        let spec = Spec::new(subwin::id("misc"), "Misc Settings", Kind::fit(560.0).sizable()).margin(Margin::ZERO).escape();
+        let close = subwin::show(ctx, spec, |ui| {
             let (area, _) = ui.allocate_exact_size(vec2(560.0, 530.0), Sense::hover());
             let at = |x: f32, y: f32, w: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(w, 24.0));
             let p = ui.painter().clone();
@@ -454,8 +494,8 @@ impl App {
                 });
             }
         });
-        self.dlg.misc = open;
-        if !open {
+        self.dlg.misc = !close;
+        if close {
             if let Some((mut port, mut group)) = self.dlg.misc_text.take() {
                 commit_osc_text(&mut self.settings, &mut port, &mut group);
             }
@@ -488,11 +528,10 @@ impl App {
     }
 
     fn audio_window(&mut self, ctx: &Context) {
-        let mut open = true;
         let (mut apply, mut panel) = (false, false);
         let info = self.engine.info.clone();
         let Some(d) = self.dlg.audio.as_mut() else { return };
-        dialog("Audio Settings").open(&mut open).default_width(480.0).show(ctx, |ui| {
+        let close = subwin::show(ctx, Spec::new(subwin::id("audio"), "Audio Settings", Kind::fit(480.0).sizable()).escape(), |ui| {
             let asio = d.cfg.backend == "ASIO";
             let same = info.as_ref().is_some_and(|i| i.backend == d.cfg.backend && (d.cfg.device.is_empty() || i.name == d.cfg.device));
             Grid::new("audio_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -616,7 +655,7 @@ impl App {
                 };
             }
             ui.add_space(6.0);
-            apply = ui.button("  Apply  ").clicked();
+            apply |= ui.button("  Apply  ").clicked();
         });
         if panel {
             self.engine.control_panel();
@@ -636,17 +675,16 @@ impl App {
             self.open_midi();
             self.settings.save();
         }
-        if !open {
+        if close {
             self.dlg.audio = None;
         }
     }
 
     fn colours_window(&mut self, ctx: &Context) {
-        let mut open = true;
         let (mut load, mut save, mut delete, mut reset) = (None, false, false, false);
         let Some(d) = self.dlg.colours.as_mut() else { return };
         let scheme = &mut self.scheme;
-        dialog("Colour Schemes").open(&mut open).default_width(380.0).show(ctx, |ui| {
+        let close = subwin::show(ctx, Spec::new(subwin::id("colours"), "Colour Schemes", Kind::fit(380.0).sizable()).escape(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Scheme:");
                 ComboBox::from_id_salt("schemes").selected_text(&scheme.name).show_ui(ui, |ui| {
@@ -671,11 +709,11 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Save as:");
                 ui.text_edit_singleline(&mut d.name);
-                save = ui.add_enabled(!d.name.trim().is_empty() && d.name.trim() != "default", Button::new("Save")).clicked();
+                save |= ui.add_enabled(!d.name.trim().is_empty() && d.name.trim() != "default", Button::new("Save")).clicked();
             });
             ui.horizontal(|ui| {
-                reset = ui.button("Default colours").clicked();
-                delete = scheme.name != "default" && ui.button("Delete this scheme").clicked();
+                reset |= ui.button("Default colours").clicked();
+                delete |= scheme.name != "default" && ui.button("Delete this scheme").clicked();
             });
         });
         let dir = settings::dir();
@@ -711,18 +749,17 @@ impl App {
                 d.names = list_schemes();
             }
         }
-        if !open {
+        if close {
             self.dlg.colours = None;
         }
     }
 
     fn app_maps_window(&mut self, ctx: &Context) {
-        let mut open = true;
         let mut remove = None;
         let mut add = None;
         let maps = &self.settings.app_mappings;
         let d = &mut self.dlg.app_draft;
-        dialog("Application Mappings").open(&mut open).default_width(480.0).show(ctx, |ui| {
+        let close = subwin::show(ctx, Spec::new(subwin::id("app_maps"), "Application Mappings", Kind::fit(480.0).sizable()), |ui| {
             ui.label("MIDI CC messages or OSC addresses that run main window commands.");
             Grid::new("app_maps").num_columns(4).striped(true).show(ui, |ui| {
                 for h in ["Source", "Channel", "Command", ""] {
@@ -775,16 +812,18 @@ impl App {
         if changed {
             self.settings.save();
         }
-        self.dlg.app_maps = open;
+        self.dlg.app_maps = !close;
     }
 
     fn log_window(&mut self, ctx: &Context) {
-        let mut open = true;
         let mut clear = false;
         let log = &self.log;
-        dialog("Event Log").open(&mut open).default_size([520.0, 320.0]).show(ctx, |ui| {
+        // The original keeps its Event Log above every window (the non-modal helper 0x140030b30
+        // called with alwaysOnTop set at 0x1400392d1).
+        let spec = Spec::new(subwin::id("log"), "Event Log", Kind::fill(vec2(520.0, 320.0), vec2(300.0, 160.0), true)).on_top(true).escape();
+        let close = subwin::show(ctx, spec, |ui| {
             ui.horizontal(|ui| {
-                clear = ui.button("Clear").clicked();
+                clear |= ui.button("Clear").clicked();
                 if ui.button("Copy all").clicked() {
                     ui.ctx().copy_text(log.iter().cloned().collect::<Vec<_>>().join("\n"));
                 }
@@ -798,36 +837,40 @@ impl App {
         if clear {
             self.log.clear();
         }
-        self.dlg.log = open;
+        self.dlg.log = !close;
     }
 
     fn info_windows(&mut self, ctx: &Context) {
-        let mut about = self.dlg.about;
-        dialog("About").open(&mut about).resizable(false).show(ctx, |ui| {
-            ui.heading(crate::app::TITLE);
-            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-            ui.label("A live effects host for VST and VST3 plugins, with ASIO and Windows audio.");
-            ui.label("Built with Rust and egui.");
-            if let Some(i) = &self.engine.info {
-                ui.label(format!("Audio: {} ({}), {} Hz, {} samples", i.name, i.backend, i.sample_rate, i.block));
-            }
-        });
-        self.dlg.about = about;
-        let mut docs = self.dlg.docs;
-        dialog("Documentation").open(&mut docs).default_width(460.0).show(ctx, |ui| {
-            for line in [
-                "Double-click an empty part of the pedalboard to add a built-in processor or a plugin.",
-                "Drag from an output pin to an input pin to connect two boxes. Click a cable to select it (Ctrl-click adds more) and press Delete to remove it.",
-                "Connect Midi Input or OSC Input to a box's param pin, then use the mappings button to tie controllers to its parameters.",
-                "Switch patches with the patch selector or the - and + buttons; Edit > Organise patches renames and reorders them.",
-                "Options > Plugin List scans your VST and VST3 folders. Options > Audio Settings picks the device; ASIO with a small buffer gives the lowest latency.",
-                "The bypass button passes audio straight through a box; the cross removes it.",
-            ] {
-                ui.label(line);
-                ui.add_space(4.0);
-            }
-        });
-        self.dlg.docs = docs;
+        if self.dlg.about {
+            let info = self.engine.info.as_ref();
+            let close = subwin::show(ctx, Spec::new(subwin::id("about"), "About", Kind::fit_between(300.0, 420.0).sizable()).escape(), |ui| {
+                ui.heading(crate::app::TITLE);
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.label("A live effects host for VST and VST3 plugins, with ASIO and Windows audio.");
+                ui.label("Built with Rust and egui.");
+                if let Some(i) = info {
+                    ui.label(format!("Audio: {} ({}), {} Hz, {} samples", i.name, i.backend, i.sample_rate, i.block));
+                }
+            });
+            self.dlg.about = !close;
+        }
+        if self.dlg.docs {
+            let close = subwin::show(ctx, Spec::new(subwin::id("docs"), "Documentation", Kind::fit(460.0)).escape(), |ui| {
+                for line in [
+                    "Double-click an empty part of the pedalboard to add a built-in processor or a plugin.",
+                    "Drag from an output pin to an input pin to connect two boxes. Click a cable to select it (Ctrl-click adds more) and press Delete to remove it.",
+                    "Connect Midi Input or OSC Input to a box's param pin, then use the mappings button to tie controllers to its parameters.",
+                    "Switch patches with the patch selector or the - and + buttons; Edit > Organise patches renames and reorders them.",
+                    "Options > Plugin List scans your VST and VST3 folders. Options > Audio Settings picks the device; ASIO with a small buffer gives the lowest latency.",
+                    "The bypass button passes audio straight through a box; the cross removes it.",
+                    "Put the original program's documentation folder next to this program, and Documentation opens its full guide in your browser instead.",
+                ] {
+                    ui.label(line);
+                    ui.add_space(4.0);
+                }
+            });
+            self.dlg.docs = !close;
+        }
     }
 }
 
@@ -835,9 +878,66 @@ fn d_name(d: &Dialogs) -> String {
     d.colours.as_ref().map(|c| c.name.trim().to_string()).unwrap_or_default()
 }
 
+/// The original's documentation page: "index.html" in a "documentation" folder beside the
+/// program (getSpecialLocation 7, getParentDirectory, getChildFile, 0x140038f08). It counts only
+/// when it's a file, as in the original's check (GetFileAttributesW without the folder flag).
+fn docs_page(exe: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let page = exe?.parent()?.join("documentation").join("index.html");
+    page.is_file().then_some(page)
+}
+
+/// Opens a page the way the original's URL::launchInDefaultBrowser (0x14011d660) does: the
+/// shell's default action for it, shown as the program was asked (SW_SHOWDEFAULT, 10). True when
+/// the shell took it, a result above 32.
+fn open_in_browser(page: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT;
+    let file: Vec<u16> = page.as_os_str().encode_wide().chain(Some(0)).collect();
+    let null = std::ptr::null();
+    let done = unsafe { ShellExecuteW(std::ptr::null_mut(), null, file.as_ptr(), null, null, SW_SHOWDEFAULT) };
+    done as isize > 32
+}
+
+/// What the save question calls the patch file (getDocumentTitle, 0x14002cd10): its name without
+/// the extension, or "Unnamed" (0x14040ffc0) while there's no file on the disk.
+fn doc_title(file: Option<&std::path::Path>) -> String {
+    match file.filter(|f| f.exists()).and_then(|f| f.file_stem()) {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => "Unnamed".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_save_question_names_the_file_or_unnamed() {
+        let f = std::env::temp_dir().join(format!("pedalhost-title-{}.pdl", std::process::id()));
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(doc_title(Some(&f)), format!("pedalhost-title-{}", std::process::id()));
+        std::fs::remove_file(&f).unwrap();
+        // A file that has gone, or none yet, is "Unnamed".
+        assert_eq!(doc_title(Some(&f)), "Unnamed");
+        assert_eq!(doc_title(None), "Unnamed");
+    }
+
+    #[test]
+    fn documentation_is_the_page_beside_the_program_only_when_it_is_a_file() {
+        let dir = std::env::temp_dir().join(format!("pedalhost-docs-{}", std::process::id()));
+        let exe = dir.join("pedalhost.exe");
+        let page = dir.join("documentation").join("index.html");
+        assert_eq!(docs_page(Some(&exe)), None);
+        // A folder with the page's name isn't the page.
+        std::fs::create_dir_all(&page).unwrap();
+        assert_eq!(docs_page(Some(&exe)), None);
+        std::fs::remove_dir(&page).unwrap();
+        std::fs::write(&page, "<html></html>").unwrap();
+        assert_eq!(docs_page(Some(&exe)), Some(page.clone()));
+        assert_eq!(docs_page(None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn osc_boxes_keep_a_usable_port_and_trim_the_group() {

@@ -62,12 +62,18 @@ pub fn popup_list(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row], c
     popup_list_min(ui, id, at, above, rows, c, 140.0)
 }
 
+/// The size of a popup list at least `min_w` wide.
+pub fn popup_size(ctx: &Context, rows: &[Row], min_w: f32) -> Vec2 {
+    let tw = |s: &str, f: FontId| ctx.fonts(|fo| fo.layout_no_wrap(s.to_string(), f, Color32::BLACK).size().x);
+    let lw = rows.iter().map(|r| tw(&r.0, font(BAR_FONT))).fold(0.0f32, f32::max);
+    let sw = rows.iter().map(|r| tw(&r.1, font(13.0))).fold(0.0f32, f32::max);
+    let h: f32 = rows.iter().map(|r| if r.0.is_empty() { 8.0 } else { 22.0 }).sum::<f32>() + 4.0;
+    vec2((lw + sw + 56.0).max(min_w), h)
+}
+
 /// A popup list at least `min_w` wide.
 pub fn popup_list_min(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row], c: &Scheme, min_w: f32) -> (Option<usize>, Rect) {
-    let lw = rows.iter().map(|r| text_w(ui, &r.0, font(BAR_FONT))).fold(0.0f32, f32::max);
-    let sw = rows.iter().map(|r| text_w(ui, &r.1, font(13.0))).fold(0.0f32, f32::max);
-    let w = (lw + sw + 56.0).max(min_w);
-    let h: f32 = rows.iter().map(|r| if r.0.is_empty() { 8.0 } else { 22.0 }).sum::<f32>() + 4.0;
+    let Vec2 { x: w, y: h } = popup_size(ui.ctx(), rows, min_w);
     let screen = ui.ctx().screen_rect();
     let mut pos = at;
     if pos.y + h > screen.bottom() {
@@ -80,40 +86,51 @@ pub fn popup_list_min(ui: &Ui, id: Id, at: Pos2, above: Option<f32>, rows: &[Row
     let mut chosen = None;
     let area = Area::new(id).order(Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(r.translate(vec2(2.0, 3.0)), CornerRadius::same(2), Color32::from_black_alpha(40));
-        p.rect_filled(r, CornerRadius::ZERO, c.get(colours::DIALOG_INNER));
-        p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(150)), StrokeKind::Inside);
-        let text = c.get(colours::TEXT);
-        let mut y = r.top() + 2.0;
-        for (k, row) in rows.iter().enumerate() {
-            if row.0.is_empty() {
-                p.hline((r.left() + 6.0)..=(r.right() - 6.0), y + 4.0, Stroke::new(1.0f32, Color32::from_black_alpha(50)));
-                y += 8.0;
-                continue;
-            }
-            let ir = Rect::from_min_size(pos2(r.left() + 2.0, y), vec2(w - 4.0, 22.0));
-            y += 22.0;
-            let resp = ui.interact(ir, id.with(k), Sense::click());
-            let col = if row.2 { text } else { text.gamma_multiply(0.4) };
-            if row.2 && resp.hovered() {
-                p.rect_filled(ir, CornerRadius::ZERO, c.get(colours::MENU_SELECTION));
-            }
-            if row.3 {
-                let m = pos2(ir.left() + 9.0, ir.center().y);
-                p.line_segment([m + vec2(-4.0, 0.0), m + vec2(-1.0, 4.0)], Stroke::new(2.0f32, col));
-                p.line_segment([m + vec2(-1.0, 4.0), m + vec2(5.0, -5.0)], Stroke::new(2.0f32, col));
-            }
-            text_at(p, ir.left() + 20.0, baseline(ir, BAR_FONT), Align::Min, &row.0, font(BAR_FONT), col);
-            if !row.1.is_empty() {
-                text_at(p, ir.right() - 8.0, baseline(ir, 13.0), Align::Max, &row.1, font(13.0), col.gamma_multiply(0.7));
-            }
-            if row.2 && resp.clicked() {
-                chosen = Some(k);
-            }
-        }
+        ui.painter().rect_filled(r.translate(vec2(2.0, 3.0)), CornerRadius::same(2), Color32::from_black_alpha(40));
+        chosen = popup_rows(ui, r, id, rows, c, None).0;
     });
     (chosen, area.response.rect)
+}
+
+/// A popup list's frame and rows in `r`, the `hot` row (picked with the keys) lit as the one
+/// under the mouse is. Returns the row clicked and the row under the mouse.
+pub fn popup_rows(ui: &Ui, r: Rect, id: Id, rows: &[Row], c: &Scheme, hot: Option<usize>) -> (Option<usize>, Option<usize>) {
+    let p = ui.painter();
+    p.rect_filled(r, CornerRadius::ZERO, c.get(colours::DIALOG_INNER));
+    p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(150)), StrokeKind::Inside);
+    let text = c.get(colours::TEXT);
+    let (mut clicked, mut hovered) = (None, None);
+    let mut y = r.top() + 2.0;
+    for (k, row) in rows.iter().enumerate() {
+        if row.0.is_empty() {
+            p.hline((r.left() + 6.0)..=(r.right() - 6.0), y + 4.0, Stroke::new(1.0f32, Color32::from_black_alpha(50)));
+            y += 8.0;
+            continue;
+        }
+        let ir = Rect::from_min_size(pos2(r.left() + 2.0, y), vec2(r.width() - 4.0, 22.0));
+        y += 22.0;
+        let resp = ui.interact(ir, id.with(k), Sense::click());
+        let col = if row.2 { text } else { text.gamma_multiply(0.4) };
+        if row.2 && resp.hovered() {
+            hovered = Some(k);
+        }
+        if row.2 && (resp.hovered() || hot == Some(k)) {
+            p.rect_filled(ir, CornerRadius::ZERO, c.get(colours::MENU_SELECTION));
+        }
+        if row.3 {
+            let m = pos2(ir.left() + 9.0, ir.center().y);
+            p.line_segment([m + vec2(-4.0, 0.0), m + vec2(-1.0, 4.0)], Stroke::new(2.0f32, col));
+            p.line_segment([m + vec2(-1.0, 4.0), m + vec2(5.0, -5.0)], Stroke::new(2.0f32, col));
+        }
+        text_at(p, ir.left() + 20.0, baseline(ir, BAR_FONT), Align::Min, &row.0, font(BAR_FONT), col);
+        if !row.1.is_empty() {
+            text_at(p, ir.right() - 8.0, baseline(ir, 13.0), Align::Max, &row.1, font(13.0), col.gamma_multiply(0.7));
+        }
+        if row.2 && resp.clicked() {
+            clicked = Some(k);
+        }
+    }
+    (clicked, hovered)
 }
 
 pub(crate) fn pressed_outside(ui: &Ui, keep: &[Rect]) -> bool {

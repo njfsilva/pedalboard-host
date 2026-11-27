@@ -3,7 +3,7 @@
 //! folder (0x1400887b0).
 
 use crate::app::App;
-use crate::bars::{baseline, popup_list_min, pressed_outside, Row};
+use crate::bars::{baseline, Row};
 use crate::colours::{self, Scheme};
 use crate::graph::{Node, NodeKind};
 use crate::pdl::{b64_decode, xml_from_binary, xml_to_binary};
@@ -530,7 +530,8 @@ pub struct BarSlot {
     pub cache: Cache,
     /// Text being typed in the app-drawn bar.
     draft: Option<String>,
-    popup: bool,
+    /// The bar's list of presets, while it's open.
+    pub dd: crate::subwin::DropDown,
 }
 
 /// The bar's colours for the native windows.
@@ -589,7 +590,7 @@ pub fn bar_ui(ui: &mut Ui, r: Rect, id: Id, slot: &mut BarSlot, c: &Scheme) -> V
         let mut st = out.state.clone();
         st.cursor.set_char_range(Some(text::CCursorRange::two(text::CCursor::new(0), text::CCursor::new(s.chars().count()))));
         st.store(ui.ctx(), edit_id);
-        slot.popup = false;
+        slot.dd.close();
     }
     if out.response.lost_focus() {
         let esc = ui.input(|i| i.key_pressed(Key::Escape));
@@ -605,21 +606,7 @@ pub fn bar_ui(ui: &mut Ui, r: Rect, id: Id, slot: &mut BarSlot, c: &Scheme) -> V
     }
 
     if combo.clicked() {
-        slot.popup = !slot.popup;
-    }
-    if slot.popup {
-        let rows: Vec<Row> = if slot.bar.items.is_empty() {
-            vec![(NO_CHOICES.to_string(), String::new(), false, false)]
-        } else {
-            slot.bar.items.iter().enumerate().map(|(i, n)| (n.clone(), String::new(), true, slot.bar.current == i + 1)).collect()
-        };
-        let (pick, pr) = popup_list_min(ui, id.with("popup"), cr.left_bottom(), Some(cr.top()), &rows, c, cr.width());
-        if let Some(k) = pick.filter(|_| !slot.bar.items.is_empty()) {
-            slot.popup = false;
-            ev.push(BarEvent::Pick(k));
-        } else if pressed_outside(ui, &[pr, cr]) || ui.input(|i| i.key_pressed(Key::Escape)) {
-            slot.popup = false;
-        }
+        slot.dd.toggle(ui, cr);
     }
 
     let l = look(c);
@@ -639,33 +626,25 @@ pub fn bar_ui(ui: &mut Ui, r: Rect, id: Id, slot: &mut BarSlot, c: &Scheme) -> V
     ev
 }
 
-/// A window to put a file chooser in front of.
-struct Parent(isize);
-
-impl raw_window_handle::HasWindowHandle for Parent {
-    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let h = std::num::NonZeroIsize::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
-        let raw = raw_window_handle::RawWindowHandle::Win32(raw_window_handle::Win32WindowHandle::new(h));
-        // The handle belongs to a window that outlives the chooser, which is modal.
-        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
-    }
+/// The bar's list of presets, open under its box as a window of its own that belongs to the
+/// editor window `owner`. Returns the preset picked.
+pub fn bar_list(ctx: &Context, vid: ViewportId, owner: ViewportId, slot: &mut BarSlot, c: &Scheme) -> Option<BarEvent> {
+    slot.dd.open?;
+    let rows: Vec<Row> = if slot.bar.items.is_empty() {
+        vec![(NO_CHOICES.to_string(), String::new(), false, false)]
+    } else {
+        slot.bar.items.iter().enumerate().map(|(i, n)| (n.clone(), String::new(), true, slot.bar.current == i + 1)).collect()
+    };
+    let k = crate::subwin::drop_list(ctx, vid, owner, &rows, &mut slot.dd, c, COMBO[2] as f32)?;
+    (!slot.bar.items.is_empty()).then_some(BarEvent::Pick(k))
 }
 
-impl raw_window_handle::HasDisplayHandle for Parent {
-    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Ok(raw_window_handle::DisplayHandle::windows())
-    }
-}
-
-/// A chooser for one .fxp file, in front of `parent`.
+/// A chooser for one .fxp file, in front of `parent` (0: the window in front).
 pub fn choose_fxp(title: &str, parent: isize, save_as: Option<&str>) -> Option<PathBuf> {
-    let mut d = rfd::FileDialog::new().set_title(title).add_filter("fxp", &["fxp"]);
-    if parent != 0 {
-        d = d.set_parent(&Parent(parent));
-    }
+    let d = rfd::FileDialog::new().set_title(title).add_filter("fxp", &["fxp"]);
     match save_as {
-        Some(name) => d.set_file_name(name).save_file(),
-        None => d.pick_file(),
+        Some(name) => crate::subwin::chooser(parent, d.set_file_name(name), |d| d.save_file()),
+        None => crate::subwin::chooser(parent, d, |d| d.pick_file()),
     }
 }
 
@@ -691,7 +670,10 @@ impl App {
     pub fn start_presets(&mut self) {
         editor::set_bar_look(look(&self.scheme));
         let ctx = self.egui_ctx.clone();
-        editor::set_waker(Box::new(move || ctx.request_repaint()));
+        editor::set_waker(Box::new(move || {
+            ctx.request_repaint();
+            crate::tray::wake();
+        }));
         if self.shot.is_some() {
             return;
         }
@@ -709,7 +691,7 @@ impl App {
         let slot = self.preset_bars.entry(id).or_default();
         slot.bar.fill(n, &folder(&n.info));
         slot.draft = None;
-        slot.popup = false;
+        slot.dd.close();
         show(n, &slot.bar);
     }
 
@@ -743,7 +725,7 @@ impl App {
     pub fn bar_event(&mut self, id: u32, e: BarEvent) {
         let Some((dir, parent)) = self.graph.node(id).map(|n| (folder(&n.info), native_window(n))) else { return };
         let file = if e == BarEvent::Import {
-            match choose_fxp(IMPORT_TITLE, if parent != 0 { parent } else { self.hwnd }, None) {
+            match choose_fxp(IMPORT_TITLE, parent, None) {
                 Some(f) => Some(f),
                 None => return,
             }

@@ -49,6 +49,37 @@ Other window values:
 - **Edit:** Delete selected connection(s), Organise patches, User Preset Management.
 - **Options:** Misc Settings, Audio Settings, Plugin List, Colour Schemes, Application Mappings.
 - **Help:** Documentation, Event Log, About.
+- **Documentation** (its case in the menu handler at 0x140038f08; text "Loads the documentation in your default browser.", 0x140410f60): F1 is its key (0x10070, no modifiers, set at 0x140037706 for addDefaultKeypress at 0x14003770e). It takes the program's own file (getSpecialLocation 7), its folder, then "documentation" (0x140411308) and "index.html" (0x140411318). When that's a file (GetFileAttributesW without the folder flag) it opens it with URL::launchInDefaultBrowser (0x14011d660): ShellExecuteW with the default action and show mode 10, ignoring a failure. Otherwise a warning box titled "Documentation Missing" (0x140411350) says "Could not find documentation/index.html" (0x140411328). The original's folder ships that page; it opens no window of its own.
+  - **Rebuild:** the same page beside the rebuild's program opens the same way. Where it isn't there, or the shell can't open it, the rebuild shows its own short guide instead of the warning (**rebuild's own**: the rebuild ships no documentation folder, and the guide says where to put the original's). The guide closes with Escape (**rebuild's own**).
+
+## Dialog windows (showModalDialog 0x140030940, non-modal helper 0x140030b30, centreAroundComponent 0x14021f700)
+
+- **Which:** seven dialogs go through JUCE's DialogWindow::showModalDialog (0x140030940). It builds a TempDialogWindow, gives it the content (0x14021cdc0), places it (0x14021f700) and runs the modal loop (0x1401acc50). Each is a desktop window of its own, not a panel inside the main window:
+  - Patch Organiser (title 0x1404112d0, call 0x140038576), User Preset Management (0x140410d10, call 0x14003866b), Misc Settings (0x140410d88, call 0x140038854), Audio Settings (0x140410de8, call 0x14003895f), Application Mappings (0x1404112f0, call 0x140038cbf) and About (0x1404110b0, call 0x140038eb3). Each is on the scheme's "Window Background", looked up just before the call (0x1402829f8).
+  - A box's "<name> Mappings" (" Mappings" appended in 0x140073980, call 0x140073b55), on a fixed 0xFFEEECE1 and centred on the plugin field.
+- **Placement** (0x14021f700): centred on the component it's given, or on the active window when given none (0x14021f8a0). With no active window it's centred on the screen (0x1401abfc0). The centred bounds are then moved, and shrunk if bigger, to fit inside the monitor's usable area reduced by 12 px on every side (0x1401901c0 with 12, constrainedWithin 0x14022da20).
+- **Frame:** the helper gives each one only a close button and always makes it resizable (setResizable(true, false), 0x14021d340).
+- **Escape** is the helper's fifth argument. It closes Patch Organiser (1 at 0x140038563), User Preset Management (0x140038658), Misc Settings (0x140038841), Audio Settings (0x14003894b) and About (0x140038ea0). It doesn't close Application Mappings (0 at 0x140038cae) or a box's "<name> Mappings" (0 at 0x140073b37).
+- **Non-modal windows** (helper 0x140030b30, constructor 0x140030840): Colour Schemes (0x140038b6c) and Event Log (0x1400392d1). Escape closes them, they're centred with the same 12 px gap and resizable, and the fourth argument keeps the window on top of every other window: on for the Event Log, off for Colour Schemes.
+- **Plugin List** (constructor 0x1400319b0, opened at 0x140038a92 and brought to the front at 0x140038aa6): a window of its own titled "Available Plugins", 300 × 400 and centred, with minimise and close buttons, resizable, with the system's title bar. It goes back to its last place ("listWindowPos", 0x14021ddc0) and closing deletes it (0x140031fe0).
+- **Taskbar:** JUCE's window flags (0x14021c5a0) always ask for a taskbar button, so each of the original's dialogs has one.
+- **Message boxes** (AlertWindow keys 0x1402188d0, standard boxes made in 0x1401e4050). A button's key needs no Ctrl, Alt or Shift, and letters ignore case.
+  - One button: Return and Escape press it.
+  - Two buttons: the first gets Return and its first letter; the second gets Escape and its first letter, unless that letter is the first button's.
+  - Three buttons: the first two get their first letters and the third gets Escape; Return does nothing.
+  - A box built with its own buttons only answers their keys: Escape cancels it only when it has no buttons, and Return presses the button when there's just one. Closing a box any other way gives 0, the cancel answer (0x140216d20).
+  - The plain message box (showMessageBox 0x140218ec0, which the preset errors call with the warning icon, 2 at 0x14008b99d; and 0x140218bd0, a copy fixed to the warning icon, called from nine places and for "Documentation Missing") has one button. Its text is "ok" (0x140425664) unless the caller names one, and the fixed copy never does.
+- **Save prompt** (saveIfNeededAndUserAgrees 0x1402324e0, through showYesNoCancelBox 0x140219400): titled "Closing document..." (0x14042e138), it asks `Do you want to save the changes to "<name>"?` (0x14042e110) with "save" (0x14042e100), "discard changes" (0x14042e0f0) and "cancel" (0x14042436c). So S saves, D discards and Escape cancels. The name is the document's title (0x14002cd10): the file's name without its extension, or "Unnamed" (0x14040ffc0). Its only caller is the main window's close button (0x14001a970).
+- **Rebuild:**
+  - Every dialog, prompt and message the app draws is a desktop window of its own, owned by the window that opened it: it stays in front of that window and hides with it. A small main window never cuts one off. None has a taskbar button (**rebuild's own**: the original's have one).
+  - Escape closes the windows the original closes with it, as listed above. While the person types in a text box or a drop-down list is open, Escape only leaves the text box or closes the list (**estimated** from how JUCE's text boxes and menus keep Escape; not read in this program).
+  - The settings windows (Misc, Audio, Colour Schemes, Application Mappings) and About can be resized like the original's; what doesn't fit scrolls. The Event Log stays on top of other windows, as in the original.
+  - The Plugin List is titled "Available Plugins". It opens at 680 × 470 because the rebuild's list has more columns, and it doesn't go back to its last place (**rebuild's own**).
+  - Message boxes take the keys above, and the plain one's button reads "ok". It shows no warning icon (**rebuild's own**). The save prompt has the original's title, question, buttons and keys. It also comes before New and Open discard changes (**rebuild's own**: the original's New and Open don't ask).
+  - A dialog opens centred on its owner, at least 12 px inside the screen's usable area and no bigger than that area; what doesn't fit scrolls.
+  - The gap is counted from the window's whole frame. On Windows 10 and 11 that includes a few invisible resize pixels, so the gap you see at the sides and bottom is a little smaller (**estimated** equivalence).
+  - Drop-down lists open under their box (above it when there's no room) and may reach the screen's edge. A dialog the person drags to the edge stays there when its contents change size.
+  - With `--screenshot`, dialogs are drawn inside the main window so the picture shows them (**rebuild's own**).
 
 ## Colours: default scheme (0x140026970)
 
@@ -375,7 +406,7 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
   - The dialog helper 0x140030940 shows it: titled "Patch Organiser" (used at 0x140038533), on "Window Background", centred, with a resizable border (0x14021d340, 0x1401e00d0). Escape closes it. It's only kept on top when the program isn't running stand-alone, so not here.
   - It runs modally (runModalLoop 0x1401acc50) and is built new each time, so it always opens with nothing selected.
   - **Rebuild:** a resizable window that opens centred at 400 × 300 with nothing selected.
-    - It leaves the main window usable, and Escape doesn't close it, like the rebuild's other windows (**rebuild's own**).
+    - It leaves the main window usable (**rebuild's own**). Escape closes it, as in the original (1 at 0x140038563), unless the person is renaming a patch, when Escape only cancels the rename.
     - It can't be made smaller than 200 × 248, which keeps Move Down in view. The original sets no limit (**estimated**).
 - **Patch list** ("patchList", 0x1404143d0, created at 0x14005c57d):
   - It sits at (8, 8, w − 106, h − 15) (resized) on "Dialog Inner Background".
@@ -537,7 +568,7 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
 
 ### User Preset Management (constructor 0x14008a320, resized 0x14008b360, paint 0x14008b2e0, buttonClicked 0x14008b450)
 
-- **Opening:** Edit > User Preset Management (0x140410d10) or the box menu's "User presets...". It is 400 × 300 (0x1400385df–0x140038601) and goes through the same dialog helper as the organiser (0x140030940, called at 0x14003866b): centred on the screen, resizable (0x14021d340), only a close button (4), Escape closes it (flag 1 at 0x140038658), and it blocks the main window until it's closed (runModalLoop 0x1401acc50). The original builds a new window each time; the rebuild brings an open one to the front.
+- **Opening:** Edit > User Preset Management (0x140410d10) or the box menu's "User presets...". It is 400 × 300 (0x1400385df–0x140038601) and goes through the same dialog helper as the organiser (0x140030940, called at 0x14003866b): centred on the active window (0x14021f700, see Dialog windows), resizable (0x14021d340), only a close button (4), Escape closes it (flag 1 at 0x140038658), and it blocks the main window until it's closed (runModalLoop 0x1401acc50). The original builds a new window each time; the rebuild brings an open one to the front.
 - **Look** (paint 0x14008b2e0): the whole window 0xEEECE1, whatever the colour scheme, and a 0x40000000 shade 1 px larger than the tree all round.
 - **The tree** "presetList" (0x1404185c0) at (8, 8, w − 106, h − 15):
   - its root is hidden (RootItem 0x140089fd0); under it, a folder per plugin (PluginItem 0x140089bc0, its presets listed with "*.fxp" when it opens 0x140089ce0, painted bold 0x140089e60) and its presets (PresetItem 0x140089870, painted plain and 4 px in, 0x140089980);
@@ -567,12 +598,12 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
   - Import's list holds the preset folder names of every plugin in the plugin list and of the built-in processors, sorted and without repeats; the original lists the plugin list's names in its own order (**estimated**).
   - Export adds ".fxp" to a name typed with another extension instead of replacing it, and suggests `<preset>.fxp`. If a file already has the name with ".fxp" added, Export leaves it alone and says so, because the chooser only asked about the name as typed.
   - After a change the tree keeps which folders are closed and what's selected (**estimated**); there's no keyboard control of the tree (**estimated**).
-  - The window can't get smaller than 200 × 168, keeping Export... in view (**estimated**; the original has no limit). Like the rebuild's organiser, it doesn't block the main window and Escape doesn't close it, so Escape keeps working on the board.
-  - Escape: neither prompt button has it, so it does nothing (**estimated**: the original's AlertWindow key handling wasn't read).
+  - The window can't get smaller than 200 × 168, keeping Export... in view (**estimated**; the original has no limit). Like the rebuild's organiser, it doesn't block the main window (**rebuild's own**); Escape closes it, as in the original (1 at 0x140038658).
+  - Escape in the Copy and Rename prompts: neither button has it, and AlertWindow's keys (0x1402188d0) only cancel on Escape when a box has no buttons, so it does nothing.
 
 ## Misc settings window (constructor 0x140081dc0, buttonClicked 0x140085980)
 
-- **Size:** 560 × 530 (setSize at 0x140085077); the window isn't resizable.
+- **Size:** 560 × 530 (setSize at 0x140085077). The dialog helper makes the window resizable (0x14021d340); the controls keep the fixed places below. The rebuild's window can be resized too, and scrolls when it's smaller than its contents.
 - **Painting (paint, 0x140085450):**
   - It fills the window with "Window Background".
   - The I/O panel is the rectangle (12, 132, width − 24, 82). It is filled with "Dialog Inner Background" and outlined 1 px in black at 25% alpha (0x40000000).
@@ -626,6 +657,21 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
 - **Rebuild's own rules (estimated):**
   - A port that isn't a number from 1 to 65535 goes back to the current one. The original would simply read it as a number.
   - "Start in tray" can only be ticked while the tray icon is on.
+
+## Tray icon and closing the window (TrayIcon 0x1400891a0, closeButtonPressed 0x14001a970)
+
+- **Start:** App::initialise (0x140019980) creates the main window hidden when "Display tray icon" and "Start in tray" are both on. With the icon on it also makes the TrayIcon (0x1400891a0) and keeps it at App+0x30.
+- **The icon:** a picture stored in the program (a PNG at 0x14040b870, 0x211 bytes) with the tooltip "Pedalboard 2".
+  - A left double-click shows or hides the main window (mouseDoubleClick 0x140089830). A single click does nothing.
+  - A right click (mouseDown 0x140089360) opens a menu: "Show Pedalboard" while the window is hidden, or "Hide Pedalboard", then a separator and "Quit" (0x140418450). Show/Hide toggles the window. Quit runs the close button's code.
+- **Close button** (closeButtonPressed 0x14001a970, slot 46 of the main window's vtable 0x140282d68): with the icon on and the window showing, it only hides the window. Otherwise it asks to save (0x1402324e0, see Dialog windows) and quits (0x140222f80) unless that's cancelled.
+- **File > Exit** (0x140038342) calls the same close button code, so with the icon on, Exit also only hides the window.
+- **Minimise** is JUCE's own (slots 47 and 48 aren't overridden): it only minimises, icon or not.
+- **Rebuild:**
+  - The icon uses the main window's own icon, the tooltip and menu say "Pedalboard Host" ("Show Pedalboard Host", "Hide Pedalboard Host"), and the menu opens when the right button is released (**rebuild's own**). A minimised window counts as hidden, so Show brings it up.
+  - Quit always quits, asking to save first when there are changes. In the original it only hides a window that's showing (that quirk isn't kept, **rebuild's own**).
+  - While the window is in the tray the app keeps working: MIDI program changes, MIDI and OSC mappings and the plugin windows' preset bars are handled at once, and the rest (plugins' chores, audio device checks) at the pace the window keeps while audio runs, every 33 ms. Windows doesn't paint a hidden window and a frame of the app waits for a paint, so the icon's thread posts the paints itself (**rebuild's own**; the original's timers don't depend on its window). A minimised window still gets its paints, so minimising needs nothing.
+  - A dialog that opens while the window is in the tray (an audio device error, for example) waits until the window shows again.
 
 ## OSC input (0x140016fa0, 0x14003ab00, 0x14003ac90, 0x14003b190)
 

@@ -553,7 +553,7 @@ impl Field {
             }
         }
         self.selected.retain(|s| g.conns.contains(s));
-        let modal = fu.ctx().memory(|m| m.top_modal_layer().is_some());
+        let modal = fu.ctx().memory(|m| m.top_modal_layer().is_some()) || crate::subwin::modal();
         if !self.selected.is_empty() && !modal && !fu.ctx().wants_keyboard_input() && fu.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
             act.push(Action::DeleteConns);
         }

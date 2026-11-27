@@ -47,6 +47,7 @@ impl Inputs {
                 if bytes.first().is_some_and(|b| *b < 0xF8) {
                     let _ = u.send(Incoming::Midi(bytes.to_vec()));
                     c.request_repaint();
+                    crate::tray::wake();
                 }
             };
             match mi.connect(&port, "input", cb, ()) {

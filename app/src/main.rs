@@ -23,6 +23,7 @@ mod plugin_list;
 mod plugins;
 mod presets;
 mod settings;
+mod subwin;
 mod tempo;
 mod tray;
 mod watchdog;

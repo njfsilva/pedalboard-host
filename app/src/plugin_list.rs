@@ -3,6 +3,7 @@
 
 use crate::app::App;
 use crate::plugins::{self, Scan, ScanMsg};
+use crate::subwin;
 use egui::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -91,7 +92,8 @@ impl App {
         let (mut open, mut act) = (true, None);
         let Some(st) = self.dlg.plugins.as_mut() else { return };
         let s = &self.settings;
-        Window::new("Plugin List").open(&mut open).default_size([680.0, 470.0]).collapsible(false).show(ctx, |ui| {
+        let spec = subwin::Spec::new(subwin::id("plugins"), "Available Plugins", subwin::Kind::fill(vec2(680.0, 470.0), vec2(420.0, 260.0), true).scrolled());
+        let close = subwin::show(ctx, spec, |ui| {
             CollapsingHeader::new("Plugin folders").default_open(s.plugins.is_empty()).show(ui, |ui| {
                 for (title, list, vst3) in [("VST folders", &s.vst2_folders, false), ("VST3 folders", &s.vst3_folders, true)] {
                     ui.strong(title);
@@ -177,9 +179,10 @@ impl App {
                 });
             }
         });
+        open &= !close;
         match act {
             Some(Act::AddFolder(vst3)) => {
-                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                if let Some(d) = subwin::pick_folder(rfd::FileDialog::new()) {
                     let d = d.display().to_string();
                     let list = if vst3 { &mut self.settings.vst3_folders } else { &mut self.settings.vst2_folders };
                     if !list.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
@@ -209,7 +212,7 @@ impl App {
                 self.start_plugin_scan(files);
             }
             Some(Act::AddFiles) => {
-                if let Some(files) = rfd::FileDialog::new().add_filter("VST and VST3 plugins", &["dll", "vst3"]).pick_files() {
+                if let Some(files) = subwin::pick_files(rfd::FileDialog::new().add_filter("VST and VST3 plugins", &["dll", "vst3"])) {
                     self.start_plugin_scan(files);
                 }
             }

@@ -24,6 +24,9 @@ pub const UNTITLED: &str = "<untitled>";
 const MENU_H: f32 = 24.0;
 const BAR_H: f32 = 40.0;
 const LOG_LINES: usize = 2000;
+/// How often the window draws while audio runs, for the meters and the CPU display; the app
+/// keeps the same pace while its window is in the tray.
+pub const LIVE_FRAME: Duration = Duration::from_millis(33);
 /// A driver's reset request restarts the device this long after the last request (0x1400a7920).
 const RESET_DELAY: Duration = Duration::from_millis(500);
 /// At most this many automatic restarts within RESTART_SPAN (rebuild guard against a driver
@@ -275,6 +278,11 @@ impl App {
             restarts: Restarts::default(),
         };
         app.start_presets();
+        crate::subwin::set_main(app.hwnd);
+        if app.shot.is_some() {
+            // The check picture is of the main window, so its dialogs are drawn inside it.
+            cc.egui_ctx.set_embed_viewports(true);
+        }
         if app.shot.is_none() {
             if let Err(e) = app.open_device() {
                 app.message("Audio Device Error", &e);
@@ -551,7 +559,7 @@ impl App {
     pub fn save(&mut self, as_new: bool) -> bool {
         let path = match (&self.file, as_new) {
             (Some(f), false) => Some(f.clone()),
-            _ => self.pdl_dialog().set_file_name("Untitled.pdl").save_file(),
+            _ => crate::subwin::save_file(self.pdl_dialog().set_file_name("Untitled.pdl")),
         };
         let Some(mut path) = path else { return false };
         if path.extension().is_none() {
@@ -577,6 +585,11 @@ impl App {
 
     /// Runs a command, first asking about unsaved changes where one would be lost.
     pub fn run(&mut self, cmd: Cmd) {
+        // File > Exit runs the main window's close-button code in the original (0x140038342
+        // calls closeButtonPressed, 0x14001a970): with the tray icon on it only hides the window.
+        if matches!(cmd, Cmd::Exit) && self.shot.is_none() && self.hide_to_tray() {
+            return;
+        }
         if matches!(cmd, Cmd::New | Cmd::Open | Cmd::Exit) && self.dirty && self.shot.is_none() {
             self.dlg.confirm = Some(cmd);
             return;
@@ -586,10 +599,25 @@ impl App {
 
     pub fn run_now(&mut self, cmd: Cmd) {
         let sh = self.engine.shared.clone();
+        // A window that's already open comes to the front.
+        let window = match cmd {
+            Cmd::MiscSettings => "misc",
+            Cmd::AudioSettings => "audio",
+            Cmd::PluginList => "plugins",
+            Cmd::ColourSchemes => "colours",
+            Cmd::AppMappings => "app_maps",
+            Cmd::Documentation => "docs",
+            Cmd::EventLog => "log",
+            Cmd::About => "about",
+            _ => "",
+        };
+        if !window.is_empty() {
+            crate::subwin::focus(&self.egui_ctx, crate::subwin::id(window));
+        }
         match cmd {
             Cmd::New => self.new_file(),
             Cmd::Open => {
-                if let Some(p) = self.pdl_dialog().pick_file() {
+                if let Some(p) = crate::subwin::pick_file(self.pdl_dialog()) {
                     self.open_path(p);
                 }
             }
@@ -615,7 +643,9 @@ impl App {
             }
             Cmd::DeleteConnections => self.delete_selected(),
             Cmd::OrganisePatches => {
-                if !self.dlg.organiser {
+                if self.dlg.organiser {
+                    crate::subwin::focus(&self.egui_ctx, self.organiser_vid());
+                } else {
                     self.dlg.organiser_state = Default::default();
                     self.dlg.organiser_opens += 1;
                 }
@@ -627,7 +657,7 @@ impl App {
             Cmd::PluginList => self.dlg.plugins = Some(Default::default()),
             Cmd::ColourSchemes => self.dlg.open_colours(&self.scheme),
             Cmd::AppMappings => self.dlg.app_maps = true,
-            Cmd::Documentation => self.dlg.docs = true,
+            Cmd::Documentation => self.open_documentation(),
             Cmd::EventLog => self.dlg.log = true,
             Cmd::About => self.dlg.about = true,
             Cmd::PrevPatch | Cmd::NextPatch => {
@@ -829,7 +859,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &Context) {
         // A modal box (the organiser's "Select patch...") takes every key, as JUCE's modal loop does.
-        if ctx.wants_keyboard_input() || ctx.memory(|m| m.top_modal_layer().is_some()) {
+        if ctx.wants_keyboard_input() || ctx.memory(|m| m.top_modal_layer().is_some()) || crate::subwin::modal() {
             return;
         }
         let mut cmds = Vec::new();
@@ -905,6 +935,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         watchdog::set_stage(Stage::Frame);
+        crate::tray::frame_started();
         self.window = ctx.screen_rect().size();
         if !self.started {
             self.startup();
@@ -942,6 +973,10 @@ impl eframe::App for App {
         for (title, text) in errors {
             self.message(&title, &text);
         }
+        // The main window going to the back lets go of the keyboard, as the other windows do.
+        crate::subwin::root_focus(ctx);
+        // A prompt keeps the keys and clicks from the main window while it's open.
+        crate::subwin::set_modal(self.dlg.import.is_some() || self.dlg.presets.as_ref().is_some_and(|m| m.prompting()));
         self.shortcuts(ctx);
         self.tray_frame(ctx);
 
@@ -963,16 +998,22 @@ impl eframe::App for App {
         for c in std::mem::take(&mut self.pending) {
             self.run(c);
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.allow_close && self.shot.is_none() {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.dlg.confirm = Some(Cmd::Exit);
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.shot.is_none() {
+            // The close button hides the window while the tray icon is on (closeButtonPressed,
+            // 0x14001a970); the icon's own Quit goes on to close it.
+            if !crate::tray::take_quit() && self.hide_to_tray() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            } else if self.dirty {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.dlg.confirm = Some(Cmd::Exit);
+            }
         }
         self.update_title(ctx);
         if self.shot.is_some() {
             self.screenshot(ctx);
         } else if self.engine.running {
             // Meters and the CPU display move while audio runs.
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(LIVE_FRAME);
         }
         watchdog::set_stage(Stage::Idle);
     }

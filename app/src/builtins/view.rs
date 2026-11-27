@@ -298,11 +298,11 @@ fn wav_dialog(current: &str, open: bool) -> rfd::FileDialog {
 }
 
 fn pick_wav(current: &str) -> Option<PathBuf> {
-    wav_dialog(current, true).pick_file()
+    crate::subwin::pick_file(wav_dialog(current, true))
 }
 
 fn save_wav(current: &str) -> Option<PathBuf> {
-    let mut f = wav_dialog(current, false).save_file()?;
+    let mut f = crate::subwin::save_file(wav_dialog(current, false))?;
     if f.extension().is_none() {
         f.set_extension("wav");
     }

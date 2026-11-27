@@ -9,6 +9,7 @@ use crate::engine::{MidiMap, OscMap};
 use crate::pdl::El;
 use crate::plugins::PluginInfo;
 use crate::presets;
+use crate::subwin::{self, Spec};
 use crate::widgets::{bevel, bold, font, gradient_rrect, rgb, scrollbar, text_at, text_fit};
 use egui::*;
 use std::collections::BTreeSet;
@@ -181,6 +182,39 @@ fn alert_layout(ctx: &Context, title: &str, message: &str, buttons: &[&str], par
             .collect();
         AlertLayout { size: vec2(w, h), lines, combo, buttons }
     })
+}
+
+/// An AlertWindow's face filling a window of its own: the 1 px border, the title and the
+/// message. Dragging the background moves the window, as dragging a JUCE AlertWindow does.
+/// Returns where the face is, for the box and the buttons that go on it.
+fn alert_face(ui: &mut Ui, lay: &AlertLayout, text: Color32) -> Rect {
+    let (area, bg) = ui.allocate_exact_size(lay.size, Sense::drag());
+    if bg.drag_started() && !subwin::embedded(ui.ctx()) {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+    let p = ui.painter().clone();
+    p.rect_stroke(area, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(0x66)), StrokeKind::Inside);
+    for (top, s, f) in &lay.lines {
+        let r = Rect::from_min_size(pos2(area.left(), area.top() + top), vec2(area.width(), f.size));
+        text_at(&p, area.center().x, baseline(r, f.size), Align::Center, s, f.clone(), text);
+    }
+    area
+}
+
+/// An AlertWindow button filling `r`, its label in the message font. Whether it was clicked.
+fn alert_button(ui: &mut Ui, r: Rect, label: &str, enabled: bool) -> bool {
+    ui.scope_builder(UiBuilder::new().max_rect(r), |ui| ui.add_enabled(enabled, Button::new(RichText::new(label).font(font(ALERT_FONT))).min_size(r.size())))
+        .inner
+        .clicked()
+}
+
+/// The rows of a prompt's open list: `items` with the picked one ticked, or JUCE's greyed
+/// "(no choices)" when there are none.
+fn choice_rows<'a>(items: impl ExactSizeIterator<Item = &'a str>, picked: usize) -> Vec<crate::bars::Row> {
+    if items.len() == 0 {
+        return vec![(presets::NO_CHOICES.to_string(), String::new(), false, false)];
+    }
+    items.enumerate().map(|(i, s)| (s.to_string(), String::new(), true, i == picked)).collect()
 }
 
 /// The top margin that puts the text of egui's text box in `r` where a JUCE TextEditor has it:
@@ -418,6 +452,7 @@ pub struct ImportPick {
     file_name: String,
     patches: Vec<Patch>,
     sel: usize,
+    dd: subwin::DropDown,
 }
 
 /// The patches Import... finds in a file's text (buttonClicked, 0x14005d870): every child of the
@@ -534,11 +569,12 @@ struct PresetPrompt {
     choices: Vec<String>,
     pick: usize,
     fresh: bool,
+    dd: subwin::DropDown,
 }
 
 impl PresetPrompt {
     fn new(kind: PromptKind) -> PresetPrompt {
-        PresetPrompt { kind, target: None, text: String::new(), choices: Vec::new(), pick: 0, fresh: true }
+        PresetPrompt { kind, target: None, text: String::new(), choices: Vec::new(), pick: 0, fresh: true, dd: Default::default() }
     }
 }
 
@@ -552,6 +588,8 @@ pub struct PresetManager {
     sel: Option<(String, String)>,
     scroll: f32,
     prompt: Option<PresetPrompt>,
+    /// The plugin folder Import Preset picked, whose file is asked for once the prompt is gone.
+    import_into: Option<String>,
     /// Which opening this is, so each is a fresh window in the middle at the original's size.
     opens: u32,
 }
@@ -559,7 +597,16 @@ pub struct PresetManager {
 impl Default for PresetManager {
     fn default() -> PresetManager {
         static OPENS: AtomicU32 = AtomicU32::new(0);
-        PresetManager { tree: Vec::new(), listed: false, closed: BTreeSet::new(), sel: None, scroll: 0.0, prompt: None, opens: OPENS.fetch_add(1, Ordering::Relaxed) }
+        PresetManager {
+            tree: Vec::new(),
+            listed: false,
+            closed: BTreeSet::new(),
+            sel: None,
+            scroll: 0.0,
+            prompt: None,
+            import_into: None,
+            opens: OPENS.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 
@@ -843,7 +890,29 @@ fn import_preset(dir: &Path, file: &Path) -> Result<String, String> {
     Ok(name)
 }
 
+/// The window of "Select patch...", and of each opening's preset manager and its prompts.
+pub fn import_vid() -> ViewportId {
+    subwin::id("import_patch")
+}
+
+pub fn presets_vid(m: &PresetManager) -> ViewportId {
+    subwin::id(("presets", m.opens))
+}
+
+pub fn prompt_vid(m: &PresetManager) -> ViewportId {
+    subwin::id(("preset_prompt", m.opens))
+}
+
+/// The mappings editor's size, roomy enough for its lists to open, and its smallest size, which
+/// keeps a MIDI mapping's row in view. The rebuild's own (estimated).
+const MAPPINGS_SIZE: Vec2 = vec2(680.0, 400.0);
+const MAPPINGS_MIN: Vec2 = vec2(640.0, 220.0);
+
 impl App {
+    pub fn organiser_vid(&self) -> ViewportId {
+        subwin::id(("organiser", self.dlg.organiser_opens))
+    }
+
     /// MIDI learn: the next controller that arrives is given to the waiting mapping.
     pub fn learn_cc(&mut self, cc: u8) {
         let Some(k) = self.dlg.map_draft.learn.take() else { return };
@@ -877,10 +946,10 @@ impl App {
         let slug = safe(node.name()).replace(' ', "_");
         let mut midi: Vec<(usize, MidiMap)> = self.graph.midi_maps.iter().copied().enumerate().filter(|(_, m)| m.node == id).collect();
         let mut osc: Vec<(usize, OscMap)> = self.graph.osc_maps.iter().cloned().enumerate().filter(|(_, m)| m.node == id).collect();
-        let (mut changed, mut open) = (false, true);
-        let (mut del_midi, mut del_osc, mut add_midi, mut add_osc) = (None, None, false, false);
+        let (mut changed, mut del_midi, mut del_osc, mut add_midi, mut add_osc) = (false, None, None, false, false);
         let (params, learn) = (&d.params, &mut d.learn);
-        Window::new(title).id(Id::new("mappings")).open(&mut open).default_width(640.0).collapsible(false).show(ctx, |ui| {
+        let spec = Spec::new(subwin::id(("mappings", id)), &title, subwin::Kind::fill(MAPPINGS_SIZE, MAPPINGS_MIN, true).scrolled());
+        let close = subwin::show(ctx, spec, |ui| {
             ui.strong("MIDI controllers");
             if midi.is_empty() {
                 ui.label("No MIDI mappings yet.");
@@ -910,7 +979,7 @@ impl App {
                     }
                 });
             }
-            add_midi = ui.button("Add MIDI mapping").clicked();
+            add_midi |= ui.button("Add MIDI mapping").clicked();
             ui.separator();
             ui.strong("OSC addresses");
             if osc.is_empty() {
@@ -931,7 +1000,7 @@ impl App {
                     }
                 });
             }
-            add_osc = ui.button("Add OSC mapping").clicked();
+            add_osc |= ui.button("Add OSC mapping").clicked();
         });
         if changed {
             for (k, m) in &midi {
@@ -962,7 +1031,7 @@ impl App {
             self.rebuild();
             self.dirty = true;
         }
-        if !open {
+        if close {
             self.dlg.mappings = None;
             self.dlg.map_draft.learn = None;
         }
@@ -981,48 +1050,41 @@ impl App {
         if st.edit.as_ref().is_some_and(|e| e.0 >= n) {
             st.edit = None;
         }
-        let (mut open, mut op, mut renamed) = (true, None, None);
+        let (mut op, mut renamed) = (None, None);
         let patches = &self.patches;
         let c = &self.scheme;
-        // Centred like the original; the window's frame and title add about 12 x 40.
-        let screen = ctx.screen_rect();
-        let pos = (screen.center() - (ORGANISER_SIZE + vec2(12.0, 40.0)) / 2.0).max(screen.min);
-        Window::new("Patch Organiser")
-            .id(Id::new(("organiser", self.dlg.organiser_opens)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(pos)
-            .default_size(ORGANISER_SIZE)
-            .min_size(ORGANISER_MIN)
-            .show(ctx, |ui| {
-                let area = ui.available_rect_before_wrap();
-                ui.allocate_rect(area, Sense::hover());
-                let (w, h) = (area.width(), area.height());
-                let at = |x: f32, y: f32, rw: f32, rh: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(rw, rh));
-                renamed = organiser_list(ui, at(8.0, 8.0, w - 106.0, h - 15.0), patches, c, &mut st);
-                let first = st.rows.first().copied();
-                let any = first.is_some();
-                // Export... sits under Import..., so the line and the move buttons are 32 px lower
-                // than the original's (line at 140, Move Up at 152, Move Down at 184).
-                let buttons = [
-                    (8.0, "Add", "Add a new patch", Op::Add, true),
-                    (40.0, "Copy", "Duplicate selected patch", Op::Copy, any),
-                    (72.0, "Remove", "Delete selected patch", Op::Remove, any && n > 1),
-                    (104.0, "Import...", "Import patch from another .pdl file", Op::Import, true),
-                    (136.0, "Export...", "Export selected patch to a .pdl file", Op::Export, any),
-                    (184.0, "Move Up", "Move patch up", Op::Up, first.is_some_and(|r| r > 0)),
-                    (216.0, "Move Down", "Move patch down", Op::Down, first.is_some_and(|r| r + 1 < n)),
-                ];
-                let text = c.get(colours::TEXT);
-                for (y, label, tip, o, on) in buttons {
-                    let r = at(w - 90.0, y, 82.0, 24.0);
-                    if fitted_button(ui, r, label, on, text).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
-                        op = Some(o);
-                    }
+        // A window of its own in the middle of the main window, as the original's dialog opens.
+        let spec = Spec::new(self.organiser_vid(), "Patch Organiser", subwin::Kind::fill(ORGANISER_SIZE, ORGANISER_MIN, true)).margin(Margin::ZERO).escape();
+        let close = subwin::show(ctx, spec, |ui| {
+            let area = ui.available_rect_before_wrap();
+            ui.allocate_rect(area, Sense::hover());
+            let (w, h) = (area.width(), area.height());
+            let at = |x: f32, y: f32, rw: f32, rh: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(rw, rh));
+            if let Some(r) = organiser_list(ui, at(8.0, 8.0, w - 106.0, h - 15.0), patches, c, &mut st) {
+                renamed = Some(r);
+            }
+            let first = st.rows.first().copied();
+            let any = first.is_some();
+            // Export... sits under Import..., so the line and the move buttons are 32 px lower
+            // than the original's (line at 140, Move Up at 152, Move Down at 184).
+            let buttons = [
+                (8.0, "Add", "Add a new patch", Op::Add, true),
+                (40.0, "Copy", "Duplicate selected patch", Op::Copy, any),
+                (72.0, "Remove", "Delete selected patch", Op::Remove, any && n > 1),
+                (104.0, "Import...", "Import patch from another .pdl file", Op::Import, true),
+                (136.0, "Export...", "Export selected patch to a .pdl file", Op::Export, any),
+                (184.0, "Move Up", "Move patch up", Op::Up, first.is_some_and(|r| r > 0)),
+                (216.0, "Move Down", "Move patch down", Op::Down, first.is_some_and(|r| r + 1 < n)),
+            ];
+            let text = c.get(colours::TEXT);
+            for (y, label, tip, o, on) in buttons {
+                let r = at(w - 90.0, y, 82.0, 24.0);
+                if fitted_button(ui, r, label, on, text).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                    op = Some(o);
                 }
-                ui.painter().rect_filled(at(w - 89.0, 172.0, 80.0, 1.0), CornerRadius::ZERO, Color32::from_black_alpha(0x40));
-            });
+            }
+            ui.painter().rect_filled(at(w - 89.0, 172.0, 80.0, 1.0), CornerRadius::ZERO, Color32::from_black_alpha(0x40));
+        });
         // labelTextChanged (0x14005f380) renames the patch, which the main window's list shows.
         if let Some((k, name)) = renamed {
             if let Some(p) = self.patches.get_mut(k) {
@@ -1061,23 +1123,18 @@ impl App {
             None => {}
         }
         self.dlg.organiser_state = st;
-        self.dlg.organiser = open;
+        // While "Select patch..." is up the organiser can't be closed, as it can't be used.
+        self.dlg.organiser = !(close && self.dlg.import.is_none());
     }
 
     /// Import...: asks for a patch file and opens "Select patch..." on the patches in it
     /// (buttonClicked, 0x14005d870). A file it can't read says so; the original did nothing.
     fn import_patch(&mut self, ctx: &Context) {
-        let Some(path) = self.pdl_dialog().set_title(IMPORT_FILE_TITLE).pick_file() else { return };
+        let Some(path) = crate::subwin::pick_file(self.pdl_dialog().set_title(IMPORT_FILE_TITLE)) else { return };
         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| patches_in(&text)) {
             Ok(patches) => {
                 let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.dlg.import = Some(ImportPick { file_name, patches, sel: 0 });
-                // The box takes the keyboard from here on.
-                ctx.memory_mut(|m| {
-                    if let Some(id) = m.focused() {
-                        m.surrender_focus(id);
-                    }
-                });
+                self.dlg.import = Some(ImportPick { file_name, patches, sel: 0, dd: Default::default() });
                 ctx.request_repaint();
             }
             Err(e) => self.message("File error", &format!("Could not import a patch from {}: {e}", path.display())),
@@ -1096,7 +1153,7 @@ impl App {
             _ => "Patches".to_string(),
         };
         let doc = export_document(&chosen);
-        let Some(mut path) = self.pdl_dialog().set_title(EXPORT_FILE_TITLE).set_file_name(format!("{stem}.pdl")).save_file() else { return };
+        let Some(mut path) = crate::subwin::save_file(self.pdl_dialog().set_title(EXPORT_FILE_TITLE).set_file_name(format!("{stem}.pdl"))) else { return };
         if path.extension().is_none() {
             path.set_extension("pdl");
         }
@@ -1112,53 +1169,50 @@ impl App {
 
     /// "Select patch...", the box Import... opens: the patches of the file in a combo box, OK
     /// (Return) and Cancel (Escape). OK adds the chosen patch at the end of the list and marks the
-    /// file changed, but stays on the current patch. Nothing else takes input while it's open.
+    /// file changed, but stays on the current patch. It's a window of its own in front of the
+    /// organiser, and nothing else takes input while it's open.
     pub fn import_window(&mut self, ctx: &Context) {
+        let owner = self.organiser_vid();
         let Some(pick) = self.dlg.import.as_mut() else { return };
         let empty = pick.patches.is_empty();
         let (mut ok, mut cancel) = (false, false);
-        // An open list takes Return and Escape itself, and a focused button or list takes Return.
-        if !ctx.memory(|m| m.any_popup_open()) {
-            let free = ctx.memory(|m| m.focused().is_none());
-            ctx.input_mut(|i| {
-                ok = free && i.consume_key(Modifiers::NONE, Key::Enter) && !empty;
-                cancel = i.consume_key(Modifiers::NONE, Key::Escape);
-            });
-        }
         let message = format!("Patches in file: {}", pick.file_name);
-        let lay = alert_layout(ctx, IMPORT_TITLE, &message, &["OK", "Cancel"], ctx.screen_rect().size());
+        let lay = alert_layout(ctx, IMPORT_TITLE, &message, &["OK", "Cancel"], subwin::work_size(ctx));
         // The window colour is the original look's (0x1400211e0); the text keeps JUCE's default
         // black, which that look leaves alone (0x1404246b0).
         let (bg, text) = (self.scheme.get(colours::WINDOW_BG), Color32::BLACK);
-        let frame = Frame::NONE.fill(bg).shadow(ctx.style().visuals.window_shadow);
-        Modal::new(Id::new("import_patch")).backdrop_color(Color32::TRANSPARENT).frame(frame).show(ctx, |ui| {
-            let (area, _) = ui.allocate_exact_size(lay.size, Sense::hover());
-            let p = ui.painter().clone();
-            p.rect_stroke(area, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(0x66)), StrokeKind::Inside);
-            for (top, s, f) in &lay.lines {
-                let r = Rect::from_min_size(pos2(area.left(), area.top() + top), vec2(area.width(), f.size));
-                text_at(&p, area.center().x, baseline(r, f.size), Align::Center, s, f.clone(), text);
-            }
-            let combo = lay.combo.translate(area.min.to_vec2());
-            ui.scope_builder(UiBuilder::new().max_rect(combo), |ui| {
-                ui.spacing_mut().interact_size.y = combo.height();
-                let shown = pick.patches.get(pick.sel).map(|p| p.name.clone()).unwrap_or_default();
-                ComboBox::from_id_salt("patchName").width(combo.width()).truncate().selected_text(shown).show_ui(ui, |ui| {
-                    for (i, p) in pick.patches.iter().enumerate() {
-                        ui.selectable_value(&mut pick.sel, i, p.name.as_str());
-                    }
+        let c = &self.scheme;
+        let vid = import_vid();
+        let spec = Spec::new(vid, IMPORT_TITLE, subwin::Kind::Bare { size: lay.size }).owner(owner).margin(Margin::ZERO).fill(bg);
+        let close = subwin::show(ctx, spec, |ui| {
+            // An open list takes Return and Escape itself, and a focused button takes Return.
+            if pick.dd.open.is_none() {
+                let free = ui.memory(|m| m.focused().is_none());
+                ui.input_mut(|i| {
+                    ok |= free && !empty && i.consume_key(Modifiers::NONE, Key::Enter);
+                    cancel |= i.consume_key(Modifiers::NONE, Key::Escape);
                 });
-            });
+            }
+            let area = alert_face(ui, &lay, text);
+            let shown = pick.patches.get(pick.sel).map_or("", |p| p.name.as_str());
+            subwin::combo(ui, lay.combo.translate(area.min.to_vec2()), Id::new("patchName"), shown, &mut pick.dd, c);
             for (k, (label, r)) in ["OK", "Cancel"].into_iter().zip(&lay.buttons).enumerate() {
-                let r = r.translate(area.min.to_vec2());
-                let on = k == 1 || !empty;
-                let b = ui.scope_builder(UiBuilder::new().max_rect(r), |ui| ui.add_enabled(on, Button::new(RichText::new(label).font(font(ALERT_FONT))).min_size(r.size()))).inner;
-                if b.clicked() {
+                if alert_button(ui, r.translate(area.min.to_vec2()), label, k == 1 || !empty) {
                     ok |= k == 0;
                     cancel |= k == 1;
                 }
             }
         });
+        if pick.dd.open.is_some() {
+            let rows = choice_rows(pick.patches.iter().map(|p| p.name.as_str()), pick.sel);
+            if let Some(k) = subwin::drop_list(ctx, subwin::id("import_list"), vid, &rows, &mut pick.dd, c, 0.0) {
+                if k < pick.patches.len() {
+                    pick.sel = k;
+                }
+            }
+        }
+        // Its window's close (Alt+F4) is Cancel.
+        cancel |= close;
         if !(ok || cancel) {
             return;
         }
@@ -1168,15 +1222,14 @@ impl App {
                 self.dirty = true;
             }
         }
-        ctx.memory_mut(|m| m.close_popup());
         ctx.request_repaint();
     }
 
     /// User Preset Management from the menu or a mapping. The original builds a new window each
-    /// time (0x1400385d9); one that's still open here comes to the front instead.
+    /// time (0x1400385d9); one that's still open here comes to the front instead, or its prompt.
     pub fn open_presets(&mut self) {
         match &self.dlg.presets {
-            Some(m) => self.egui_ctx.move_to_top(LayerId::new(Order::Middle, Id::new(("presets", m.opens)))),
+            Some(m) => subwin::focus(&self.egui_ctx, if m.prompting() { prompt_vid(m) } else { presets_vid(m) }),
             None => self.dlg.presets = Some(PresetManager::default()),
         }
     }
@@ -1191,48 +1244,36 @@ impl App {
         if !m.listed {
             m.relist(&root);
         }
-        let (mut open, mut op) = (true, None);
+        let mut op = None;
         let c = &self.scheme;
-        // Centred like the original; the window's frame and title add about 12 x 40.
-        let screen = ctx.screen_rect();
-        let pos = (screen.center() - (PRESETS_SIZE + vec2(12.0, 40.0)) / 2.0).max(screen.min);
-        Window::new(PRESETS_TITLE)
-            .id(Id::new(("presets", m.opens)))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(pos)
-            .default_size(PRESETS_SIZE)
-            .min_size(PRESETS_MIN)
-            .show(ctx, |ui| {
-                let area = ui.available_rect_before_wrap();
-                ui.allocate_rect(area, Sense::hover());
-                // The window's own colour reaches out to its frame at the sides and bottom.
-                let margin = ui.style().spacing.window_margin;
-                let fill = Rect::from_min_max(
-                    pos2(area.left() - f32::from(margin.left), area.top()),
-                    pos2(area.right() + f32::from(margin.right), area.bottom() + f32::from(margin.bottom)),
-                );
-                let rad = ui.visuals().window_corner_radius;
-                let corners = CornerRadius { nw: 0, ne: 0, sw: rad.sw.saturating_sub(1), se: rad.se.saturating_sub(1) };
-                let mut bg = ui.painter().clone();
-                bg.set_clip_rect(fill);
-                bg.rect_filled(fill, corners, rgb(PRESETS_BG));
-                let (w, h) = (area.width(), area.height());
-                let at = |x: f32, y: f32, rw: f32, rh: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(rw, rh));
-                ui.painter().rect_filled(at(7.0, 7.0, w - 104.0, h - 13.0), CornerRadius::ZERO, colours::draw(TREE_SHADE));
-                preset_tree(ui, at(8.0, 8.0, w - 106.0, h - 15.0), &root, c, &mut m);
-                let text = c.get(colours::TEXT);
-                for (y, label, tip, o) in PRESET_BUTTONS {
-                    if fitted_button(ui, at(w - 90.0, y, 82.0, 24.0), label, true, text).on_hover_text(tip).clicked() {
-                        op = Some(o);
-                    }
+        // A window of its own in the middle of the main window, in the manager's own colour.
+        let spec = Spec::new(presets_vid(&m), PRESETS_TITLE, subwin::Kind::fill(PRESETS_SIZE, PRESETS_MIN, true)).margin(Margin::ZERO).fill(rgb(PRESETS_BG)).escape();
+        let close = subwin::show(ctx, spec, |ui| {
+            let area = ui.available_rect_before_wrap();
+            ui.allocate_rect(area, Sense::hover());
+            let (w, h) = (area.width(), area.height());
+            let at = |x: f32, y: f32, rw: f32, rh: f32| Rect::from_min_size(area.min + vec2(x, y), vec2(rw, rh));
+            ui.painter().rect_filled(at(7.0, 7.0, w - 104.0, h - 13.0), CornerRadius::ZERO, colours::draw(TREE_SHADE));
+            preset_tree(ui, at(8.0, 8.0, w - 106.0, h - 15.0), &root, c, &mut m);
+            let text = c.get(colours::TEXT);
+            for (y, label, tip, o) in PRESET_BUTTONS {
+                if fitted_button(ui, at(w - 90.0, y, 82.0, 24.0), label, true, text).on_hover_text(tip).clicked() {
+                    op = Some(o);
                 }
-            });
+            }
+        });
         if let Some(o) = op {
             self.preset_op(ctx, &mut m, o);
         }
-        if open {
+        // Import Preset asks for the file once its prompt has gone, as the original does.
+        if m.import_into.is_some() && !m.prompting() {
+            if subwin::shown(prompt_vid(&m)) {
+                ctx.request_repaint();
+            } else if let Some(f) = m.import_into.take() {
+                self.import_preset_file(&mut m, f);
+            }
+        }
+        if !close || m.prompting() {
             self.dlg.presets = Some(m);
         }
     }
@@ -1273,7 +1314,7 @@ impl App {
             // (withFileExtension, 0x14008b450); the chooser asks before writing over a file.
             (PresetOp::Export, Some((f, n))) => {
                 let src = presets::preset_path(&root.join(&f), &n);
-                let Some(mut dest) = presets::choose_fxp(EXPORT_PRESET_TITLE, self.hwnd, Some(&format!("{n}.fxp"))) else { return };
+                let Some(mut dest) = presets::choose_fxp(EXPORT_PRESET_TITLE, 0, Some(&format!("{n}.fxp"))) else { return };
                 let mut added = false;
                 if !dest.extension().is_some_and(|e| e.eq_ignore_ascii_case("fxp")) {
                     let mut s = dest.into_os_string();
@@ -1296,19 +1337,14 @@ impl App {
             _ => {}
         }
         if m.prompt.is_some() {
-            // The prompt takes the keyboard from here on.
-            ctx.memory_mut(|mm| {
-                if let Some(id) = mm.focused() {
-                    mm.surrender_focus(id);
-                }
-            });
             ctx.request_repaint();
         }
     }
 
     /// The manager's prompts (buttonClicked, 0x14008b450): Copy Preset and Rename Preset ask for a
     /// name in a text box, Import Preset for the plugin in a list, each with Cancel and Ok. Return
-    /// is Ok and Escape does nothing, as no button has it. Nothing else takes input meanwhile.
+    /// is Ok and Escape does nothing, as no button has it. Each is a window of its own in front
+    /// of the manager, and nothing else takes input meanwhile.
     pub fn preset_prompt(&mut self, ctx: &Context) {
         let Some(mut m) = self.dlg.presets.take() else { return };
         let Some(mut pr) = m.prompt.take() else {
@@ -1316,88 +1352,94 @@ impl App {
             return;
         };
         let (mut ok, mut cancel) = (false, false);
-        if pr.kind != PromptKind::Import {
-            // The text box would let go of the keyboard on Return or Escape.
-            ctx.input_mut(|i| {
-                ok = i.consume_key(Modifiers::NONE, Key::Enter);
-                i.consume_key(Modifiers::NONE, Key::Escape);
-            });
-        } else if !ctx.memory(|mm| mm.any_popup_open() || mm.focused().is_some()) {
-            // An open list takes Return itself, and a focused button or list takes it too.
-            ok = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-        }
         let (title, message) = pr.kind.words();
-        let lay = alert_layout(ctx, title, message, &PROMPT_BUTTONS, ctx.screen_rect().size());
+        let lay = alert_layout(ctx, title, message, &PROMPT_BUTTONS, subwin::work_size(ctx));
         let (bg, text) = (self.scheme.get(colours::WINDOW_BG), Color32::BLACK);
-        let frame = Frame::NONE.fill(bg).shadow(ctx.style().visuals.window_shadow);
         let c = &self.scheme;
-        Modal::new(Id::new("preset_prompt")).backdrop_color(Color32::TRANSPARENT).frame(frame).show(ctx, |ui| {
-            let (area, _) = ui.allocate_exact_size(lay.size, Sense::hover());
-            let p = ui.painter().clone();
-            p.rect_stroke(area, CornerRadius::ZERO, Stroke::new(1.0f32, Color32::from_gray(0x66)), StrokeKind::Inside);
-            for (top, s, f) in &lay.lines {
-                let r = Rect::from_min_size(pos2(area.left(), area.top() + top), vec2(area.width(), f.size));
-                text_at(&p, area.center().x, baseline(r, f.size), Align::Center, s, f.clone(), text);
+        let vid = prompt_vid(&m);
+        let spec = Spec::new(vid, title, subwin::Kind::Bare { size: lay.size }).owner(presets_vid(&m)).margin(Margin::ZERO).fill(bg);
+        let close = subwin::show(ctx, spec, |ui| {
+            if pr.kind != PromptKind::Import {
+                // The text box would let go of the keyboard on Return or Escape.
+                ui.input_mut(|i| {
+                    ok |= i.consume_key(Modifiers::NONE, Key::Enter);
+                    i.consume_key(Modifiers::NONE, Key::Escape);
+                });
+            } else if pr.dd.open.is_none() && ui.memory(|mm| mm.focused().is_none()) {
+                // An open list takes Return itself, and a focused button takes it too.
+                ok |= ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
             }
+            let area = alert_face(ui, &lay, text);
             let field = lay.combo.translate(area.min.to_vec2());
             if pr.kind == PromptKind::Import {
-                ui.scope_builder(UiBuilder::new().max_rect(field), |ui| {
-                    ui.spacing_mut().interact_size.y = field.height();
-                    let shown = pr.choices.get(pr.pick).cloned().unwrap_or_default();
-                    ComboBox::from_id_salt("plugins").width(field.width()).truncate().selected_text(shown).show_ui(ui, |ui| {
-                        for (i, n) in pr.choices.iter().enumerate() {
-                            ui.selectable_value(&mut pr.pick, i, n.as_str());
-                        }
-                    });
-                });
+                let shown = pr.choices.get(pr.pick).map_or("", |s| s.as_str());
+                subwin::combo(ui, field, Id::new("plugins"), shown, &mut pr.dd, c);
             } else {
                 name_box(ui, field, &mut pr.text, &mut pr.fresh, c);
             }
             for (k, (label, r)) in PROMPT_BUTTONS.into_iter().zip(&lay.buttons).enumerate() {
-                let r = r.translate(area.min.to_vec2());
-                let b = ui.scope_builder(UiBuilder::new().max_rect(r), |ui| ui.add(Button::new(RichText::new(label).font(font(ALERT_FONT))).min_size(r.size()))).inner;
-                if b.clicked() {
+                if alert_button(ui, r.translate(area.min.to_vec2()), label, true) {
                     cancel |= k == 0;
                     ok |= k == 1;
                 }
             }
         });
+        if pr.dd.open.is_some() {
+            let rows = choice_rows(pr.choices.iter().map(String::as_str), pr.pick);
+            if let Some(k) = subwin::drop_list(ctx, subwin::id(("preset_list", m.opens)), vid, &rows, &mut pr.dd, c, 0.0) {
+                if k < pr.choices.len() {
+                    pr.pick = k;
+                }
+            }
+        }
+        // Its window's close (Alt+F4) is Cancel.
+        cancel |= close;
         if ok {
             self.finish_prompt(&mut m, pr);
         } else if !cancel {
             m.prompt = Some(pr);
         }
         if ok || cancel {
-            ctx.memory_mut(|mm| mm.close_popup());
             ctx.request_repaint();
         }
         self.dlg.presets = Some(m);
     }
 
-    /// Ok in a prompt. Copy and Rename act in the preset's own folder; Import asks for the file
-    /// and copies it into the picked plugin's folder, making the folder if needed.
+    /// Ok in a prompt. Copy and Rename act in the preset's own folder; Import remembers the picked
+    /// plugin's folder and asks for the file once the prompt has gone (import_preset_file).
     fn finish_prompt(&mut self, m: &mut PresetManager, pr: PresetPrompt) {
         let root = presets::root();
         let done = match (pr.kind, pr.target) {
             (PromptKind::Copy, Some((f, n))) => copy_preset(&root.join(&f), &n, &pr.text).map(|_| ()),
             (PromptKind::Rename, Some((f, n))) => rename_preset(&root.join(&f), &n, &pr.text).map(|to| m.sel = Some((f, to))),
             (PromptKind::Import, _) => {
-                let Some(f) = pr.choices.get(pr.pick).cloned() else { return };
-                let Some(file) = presets::choose_fxp(IMPORT_PRESET_TITLE, self.hwnd, None) else { return };
-                let dir = root.join(&f);
-                if std::fs::create_dir_all(&dir).is_err() {
-                    self.message(IMPORT_ERROR_TITLE, IMPORT_ERROR);
-                    return;
-                }
-                import_preset(&dir, &file).map(|n| {
-                    m.closed.remove(&f);
-                    m.sel = Some((f, n));
-                })
+                m.import_into = pr.choices.get(pr.pick).cloned();
+                return;
             }
             _ => Ok(()),
         };
         if let Err(e) = done {
             self.message(presets::ERROR_TITLE, &e);
+        }
+        m.refresh();
+        self.presets_changed();
+    }
+
+    /// Import Preset's file, chosen in front of the manager and copied into the picked plugin's
+    /// folder, which is made if needed.
+    fn import_preset_file(&mut self, m: &mut PresetManager, f: String) {
+        let Some(file) = presets::choose_fxp(IMPORT_PRESET_TITLE, subwin::hwnd_of(presets_vid(m)), None) else { return };
+        let dir = presets::root().join(&f);
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.message(IMPORT_ERROR_TITLE, IMPORT_ERROR);
+            return;
+        }
+        match import_preset(&dir, &file) {
+            Ok(n) => {
+                m.closed.remove(&f);
+                m.sel = Some((f, n));
+            }
+            Err(e) => self.message(presets::ERROR_TITLE, &e),
         }
         m.refresh();
         self.presets_changed();
