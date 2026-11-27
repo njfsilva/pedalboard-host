@@ -187,7 +187,7 @@ See [`app/MECHANICS.md`](app/MECHANICS.md) for the full list.
 
 ## Status
 
-🚧 **Work in progress.** The project builds, starts and draws the main window. Its behaviour has not yet been measured against the original, and a few values in the mechanics sheet are estimates.
+🚧 **Work in progress.** While not done yet, the main workflows for the application work well, the project builds, starts and draws the main window. Its behaviour has not yet been measured against the original, and a few values in the mechanics sheet are estimates.
 
 ## License
 
