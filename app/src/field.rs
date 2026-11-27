@@ -31,7 +31,6 @@ pub enum Action {
     OpenMappings(u32),
     Bypass(u32),
     Delete(u32),
-    DeleteConns,
     SetProgram(u32, i32),
     UserPresets(u32),
     /// A box got a new name of the person's choosing.
@@ -554,9 +553,6 @@ impl Field {
         }
         self.selected.retain(|s| g.conns.contains(s));
         let modal = fu.ctx().memory(|m| m.top_modal_layer().is_some()) || crate::subwin::modal();
-        if !self.selected.is_empty() && !modal && !fu.ctx().wants_keyboard_input() && fu.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
-            act.push(Action::DeleteConns);
-        }
         if pointer.is_some_and(|m| vp.contains(m)) && !modal {
             let d = fu.input(|i| i.smooth_scroll_delta);
             self.scroll -= d;

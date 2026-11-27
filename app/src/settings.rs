@@ -13,21 +13,7 @@ pub enum AppCommand {
     TapTempo,
 }
 
-impl AppCommand {
-    pub const ALL: [AppCommand; 5] =
-        [AppCommand::NextPatch, AppCommand::PreviousPatch, AppCommand::PlayPause, AppCommand::ReturnToZero, AppCommand::TapTempo];
-    pub fn label(self) -> &'static str {
-        match self {
-            AppCommand::NextPatch => "Next Patch",
-            AppCommand::PreviousPatch => "Previous Patch",
-            AppCommand::PlayPause => "Play/Pause",
-            AppCommand::ReturnToZero => "Return to Zero",
-            AppCommand::TapTempo => "Tap Tempo",
-        }
-    }
-}
-
-/// An application mapping: a MIDI CC (channel 0 = any) or an OSC address that triggers a command.
+/// Older rebuilds stored five application commands in settings.json.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppMapping {
     pub osc: bool,
@@ -90,6 +76,7 @@ pub struct Settings {
     pub plugins: Vec<PluginInfo>,
     pub vst2_folders: Vec<String>,
     pub vst3_folders: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub app_mappings: Vec<AppMapping>,
     pub colour_scheme: String,
     pub last_file: String,

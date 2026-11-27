@@ -48,9 +48,10 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 - 🎚️ **Presets**: per-plugin preset bars, `.fxp` import/export, and a manager for copying, renaming, importing and removing presets. Built-in processors can save and load presets too.
 - ⏱️ **Main transport**: tempo, tap tempo, play/pause and return to zero.
 - 🎨 **Colour schemes**: compatible with Pedalboard2's `.colourscheme` files.
-- 🧰 **Application mappings**: trigger Next/Previous Patch, Play/Pause, Return to Zero and Tap Tempo from MIDI or OSC.
+- 🧰 **Application mappings** let you assign keyboard shortcuts, MIDI CCs and OSC messages to menu, patch and transport commands.
+- 🪟 **Desktop windows** let you place settings, the patch organiser and processor editors outside the main window. They hide and return with the main window.
 - 🛟 **Freeze and crash reports**: a watchdog writes a note and a memory snapshot if the window stops responding for 5 s or the program crashes.
-- 🪟 **System tray** support, with an optional start-in-tray mode.
+- **System tray** support keeps audio and controller mappings running while the main window is hidden. The icon returns automatically when Windows Explorer restarts.
 
 ## Getting started
 
@@ -97,9 +98,29 @@ pedalhost.exe [file.pdl] [--screenshot out.png]
 2. Scan for plugins in **Options → Plugin List**.
 3. **Double-click** an empty part of the canvas to add a processor.
 4. Drag from an output pin to an input pin to connect them.
-5. Press **e** on a box to open its editor and **m** to open its mappings.
+5. Click **e** on a processor box to open its editor or **m** to map controls to that processor's parameters.
 
 Settings are stored in `%APPDATA%\PedalboardHost\settings.json`, and the default patch is `default.pdl` in the same folder.
+
+### Map a shortcut or controller
+
+Open **Options → Application Mappings** and click **+** beside a command, such as **Patch → Next Patch** or **Main Transport → Tap Tempo**. Choose an input, then click **OK**.
+
+| Input | How to assign it |
+|---|---|
+| Keyboard | Choose **Add Key Mapping** and press the shortcut. If another command uses it, confirming moves the shortcut to the new command. |
+| MIDI footswitch or controller | Choose **Add MIDI CC Mapping**. Select **MIDI Learn** and operate the control, or pick its CC number. Leave **Channel** on **Any** or choose 1–16. Each matching CC message with a value of 65–127 runs the command. |
+| OSC | Choose **Add Open Sound Control Mapping**. Type an address such as `/pedalboard/next` or pick one from **Received addresses**. **Parameter** counts float arguments from zero. The command runs when the selected float exceeds 0.5. |
+
+Select MIDI devices in **Options → Audio Settings**. For OSC, enable **OSC Input** and set the UDP port in **Options → Misc Settings**. To remove one assignment, click it and choose **Remove Mapping**. **Reset to defaults** clears custom assignments and restores the original keyboard shortcuts.
+
+Application mappings apply across patches and are saved in `%APPDATA%\PedalboardHost\AppMappings.xml`. On first use, the host imports any existing Pedalboard2 application mappings and controller assignments from older rebuild settings.
+
+### Run from the system tray
+
+On a fresh install, the main window opens and the tray icon appears. With the icon active, closing the main window or choosing **File → Exit** hides it while audio and MIDI/OSC controls keep running. Double-click the icon to show or hide the window. To exit the host, right-click the icon and choose **Quit**. The host prompts you to save any unsaved patch changes.
+
+To launch with the window hidden, enable **Start in tray** under **Options → Misc Settings** with **Display tray icon** enabled.
 
 ## Patch and preset management
 
@@ -137,8 +158,11 @@ app/
     ├── field.rs          # plugin canvas: boxes, pins and cables
     ├── graph.rs          # processing graph and the precompiled plan
     ├── bars.rs           # menu bar and bottom transport bar
-    ├── dialogs.rs        # settings, plugin list, mappings and other windows
-    ├── editors.rs        # built-in and generic parameter editors
+    ├── dialogs.rs        # settings, built-in and generic processor editors
+    ├── editors.rs        # processor mappings, patch organiser and preset manager
+    ├── app_mappings.rs   # application commands and AppMappings.xml
+    ├── app_mappings/     # mapping editor and keyboard shortcut handling
+    ├── subwin.rs         # desktop dialogs, prompts and drop-down lists
     ├── builtins.rs       # built-in processors (+ builtins/view.rs for their controls)
     ├── engine/           # audio engine: asio.rs, wasapi.rs
     ├── plugins/          # VST2 (vst2.rs), VST3 (vst3/), plugin editor windows
@@ -159,7 +183,7 @@ app/
 - The audio callback **never allocates, takes a lock or frees memory**.
 - When a patch changes, the window thread compiles a new **plan** (processing order, buffer pool and pointer tables) and sends it to the audio thread through a lock-free queue (`rtrb`). Plans that are replaced are sent back and freed on the window thread.
 - Denormals are flushed to zero.
-- MIDI and OSC mappings are applied on the audio thread, so they don't wait for the screen to redraw.
+- The audio thread applies MIDI and OSC mappings to processor parameters. The main window handles application commands. Tap Tempo uses the time each input arrived.
 
 ### Responsiveness
 
@@ -181,7 +205,7 @@ Patch files (`.pdl`), plugin state (JUCE base64), mapping XML and colour schemes
 - The Metronome uses the device's actual sample rate instead of assuming 44.1 kHz
 - The Looper keeps loops in memory (up to 120 s). Loops aren't saved with the patch.
 - Boxes can be renamed by double-clicking their title
-- Built-in and generic editors open as windows inside the main window
+- Host dialogs and built-in and generic editors share the main window's taskbar button
 
 See [`app/MECHANICS.md`](app/MECHANICS.md) for the full list.
 

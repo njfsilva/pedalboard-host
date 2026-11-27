@@ -353,7 +353,7 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
   - The slider (ParamSlider 0x1400f6a10, vtable 0x14041d448) is a bar from 0 to 1. Its text can't be typed into, and it ignores the mouse wheel, so the wheel scrolls the list. It shows the processor's own text for the value (0x1400f6b90) and sends changes as they happen (0x1400f6b10).
   - The bar is 0xFFBBBBFF from JUCE's colour table (0x140424680), drawn as (194, 194, 255) idle and (154, 154, 203) under the mouse or while dragging.
 - Differences in the rebuild:
-  - The built-in and generic editors open as windows inside the main window; a plugin's own editor gets a window of its own, as in the original. Where editors sit and whether they're open isn't remembered; a built-in's saved editorX/Y/W/H values are kept unchanged.
+  - Built-in and generic editors open as separate desktop windows owned by the main window. In `--screenshot` mode they are drawn inside it. The rebuild preserves a built-in processor's saved editorX/Y/W/H values but does not restore editor positions or reopen editors when loading a patch.
   - VST2 plugins that give an empty parameter name show "Parameter N" instead of "Unnamed".
   - The original's editors poll their processor on timers (60 ms for built-in editors, 100 ms for generic editor rows). The rebuild redraws the whole window every 33 ms while audio runs, so values show at least as quickly.
 
@@ -366,8 +366,10 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
 - **Mapping XML (0x140058ca0–0x1400595c0), kept inside the patch's `Mappings` element:**
   - `MidiMapping`: pluginId, parameterIndex, cc, latch, channel, lowerBound, upperBound.
   - `OscMapping`: pluginId, parameterIndex, address.
-  - Application mappings use `commandId`.
-- **Application commands:** Next Patch, Previous Patch, Play/Pause, Return to Zero, Tap Tempo. They trigger on a CC value > 0 (**estimated**).
+- **Application Mappings** lists the original File, Edit, Options, Help, Patch, Main Transport and Application commands. Click the plus beside a command to add a keyboard shortcut, a MIDI controller or an OSC address. Click an existing assignment to remove it. Reset to defaults restores the original shortcuts and clears custom assignments.
+- **MIDI Learn** selects the next controller received from an enabled MIDI input. You can also choose any controller from 0 to 127. An assigned controller triggers its command at values above 64. The original listens on all channels. The rebuild also supports a specific channel from 1 to 16.
+- **OSC assignments** accept a typed or previously received address and a zero-based float parameter index. A matching float above 0.5 triggers the command. Tap Tempo uses the arrival time of each input.
+- **AppMappings.xml** stores keyboard command IDs in hexadecimal and MIDI and OSC command IDs in decimal. The rebuild imports the original file and older rebuild settings on first use, then saves edits in its own user data folder. The original behavior and file format are documented in the supplied ApplicationMappingsEditor, MidiCcAlertWindow, MidiMappingManager, OscMappingManager and App source files.
 - **OSC:** the default port is 5678 (0x140081dc0). The default address for a parameter is "/<box name>/<parameter number>" (**estimated**).
 - **Event log text** follows the original's strings, for example "MIDI CC message received: CC=.. val=.. chan=..".
 
@@ -670,7 +672,7 @@ Bounds are (x, y, width, height) in the control's own space, which is w × h.
 - **Minimise** is JUCE's own (slots 47 and 48 aren't overridden): it only minimises, icon or not.
 - **Rebuild:**
   - On Windows, a fresh launch shows the tray icon and the main window, as requested. The original defaults both tray settings to off (0x140019980). Old rebuilds saved the old default even if the checkbox had never been touched. On upgrade, the icon is enabled once. A previously enabled hidden start is preserved when the old icon was enabled. An old disabled icon opens with the window showing. Later choices in Misc Settings persist.
-  - The main window supplies its icon on its own thread. The tray thread handles registration and its popup menu, and posts commands back to the main window. After a taskbar restart it registers the same icon again. If registration fails, it retries every 2000 ms (**estimated**, rebuild timing). Hiding on startup or close requires successful registration.
+  - The main window supplies its icon on its own thread. The tray thread handles registration and its popup menu, and posts commands back to the main window. When Windows Explorer restarts, the app registers the icon again. The user confirmed that the tray icon reappears on their desktop. If registration fails, it retries every 2000 ms (**estimated**, rebuild timing). Hiding on startup or close requires successful registration.
   - The icon uses the main window's own icon, the tooltip and menu say "Pedalboard Host" ("Show Pedalboard Host", "Hide Pedalboard Host"), and the menu opens when the right button is released (**rebuild's own**). A minimised window counts as hidden, so Show brings it up.
   - Quit always quits, asking to save first when there are changes. In the original it only hides a window that's showing (that quirk isn't kept, **rebuild's own**).
   - While the window is in the tray the app keeps working: MIDI program changes, MIDI and OSC mappings and the plugin windows' preset bars are handled at once, and the rest (plugins' chores, audio device checks) at the pace the window keeps while audio runs, every 33 ms. Windows doesn't paint a hidden window and a frame of the app waits for a paint, so the icon's thread posts the paints itself (**rebuild's own**; the original's timers don't depend on its window). A minimised window still gets its paints, so minimising needs nothing.
@@ -701,7 +703,7 @@ These are new in the rebuild and are not taken from the original.
   - Replaced plans go back to the window thread and are freed there.
   - Denormals are flushed to zero.
 - **Windows Audio (WASAPI):** the fallback when no ASIO driver exists. The input ring is trimmed every callback so input latency can't build up.
-- **MIDI and OSC mappings** are applied on the audio thread, without waiting for the screen.
+- The audio thread applies **MIDI and OSC processor mappings**. The main window dispatches application commands using the mappings in `AppMappings.xml`.
 - **Plugins:**
   - Both VST2 and VST3 load.
   - Plugin files are scanned in a separate short-lived process, so a crashing plugin can't take the host down. The original scans in its own process instead: it notes in a "RecentlyCrashedPluginsList" file next to its settings any plugin that crashed a scan, and scans those last the next time (plugin list window 0x1400319b0).

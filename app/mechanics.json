@@ -200,14 +200,15 @@
     {"name": "generic editor name font", "group": "editors", "value": 15.6, "unit": "px", "source": "function 0x1401ef5f0 (min(h, 24) x 0.65)"},
     {"name": "generic editor empty name", "group": "editors", "value": "Unnamed", "source": "function 0x1400f6c10"},
     {"name": "generic editor wheel scrolls the list", "group": "editors", "value": true, "source": "ParamSlider constructor 0x1400f6a10 (slider wheel off)"},
-    {"name": "built-in and generic editors open inside the main window", "group": "editors", "value": true, "estimated": true},
+    {"name": "built-in and generic editors open inside the main window", "group": "editors", "value": false, "source": "App::editor_windows uses subwin::show for desktop windows, with embedded viewports in --screenshot mode"},
 
     {"name": "midi cc full scale", "group": "mappings", "value": 127, "source": "function 0x140052ba0"},
     {"name": "latch toggles on non-zero cc", "group": "mappings", "value": true, "source": "function 0x140052ba0"},
     {"name": "bypass parameter index", "group": "mappings", "value": -1, "source": "function 0x140042290"},
     {"name": "osc default port", "group": "mappings", "value": 5678, "source": "function 0x140081dc0"},
     {"name": "default osc address", "group": "mappings", "value": "/<box name>/<parameter number>", "estimated": true},
-    {"name": "application mapping trigger", "group": "mappings", "value": "cc value > 0", "estimated": true},
+    {"name": "application mapping trigger", "group": "mappings", "value": "MIDI CC value > 64", "source": "MidiMappingManager.cpp, application command dispatch"},
+    {"name": "OSC application mapping trigger", "group": "mappings", "value": "matching float parameter > 0.5", "source": "OscMappingManager::handleFloatMessage"},
 
     {"name": "patch file root", "group": "files", "value": "Pedalboard2PatchFile", "source": "file save 0x14003b9c0 and load 0x14003c4f0 (string 0x1404113f0)"},
     {"name": "patch name attribute", "group": "files", "value": "name", "source": "string 0x14041080c used by 0x14003b9c0 and 0x14003c4f0"},
@@ -559,7 +560,7 @@
     {"name": "save prompt before New and Open", "group": "save prompt", "value": true, "estimated": true},
 
     {"name": "start hidden", "group": "tray", "value": "tray icon and start in tray both on", "source": "App::initialise 0x140019980"},
-    {"name": "restore icon when the taskbar is recreated", "group": "tray", "value": true, "source": "functions 0x140235e10 and 0x140236280"},
+    {"name": "restore icon when the taskbar is recreated", "group": "tray", "value": true, "source": "original functions 0x140235e10 and 0x140236280, confirmed in the rebuild by the user after restarting Windows Explorer"},
     {"name": "tray registration retry interval", "group": "tray", "value": 2000, "unit": "ms", "estimated": true},
     {"name": "tray tooltip in the original", "group": "tray", "value": "Pedalboard 2", "source": "TrayIcon 0x1400891a0"},
     {"name": "tray tooltip", "group": "tray", "value": "Pedalboard Host", "estimated": true},

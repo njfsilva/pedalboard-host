@@ -76,7 +76,7 @@ impl Server {
                                 let _ = p.push(OscEvent { hash: osc_hash(&m.address), value: v });
                             }
                         }
-                        let _ = to_ui.send(Incoming::Osc { address: m.address, tags: m.tags, args: m.args });
+                        let _ = to_ui.send(Incoming::Osc { address: m.address, tags: m.tags, args: m.args, received: std::time::Instant::now() });
                     }
                     ctx.request_repaint();
                     crate::tray::wake();

@@ -16,8 +16,8 @@ impl Default for TapTempo {
 
 impl TapTempo {
     /// Registers a tap; returns the new tempo once there are two or more taps.
-    pub fn tap(&mut self) -> Option<f64> {
-        let now = self.start.elapsed().as_secs_f64();
+    pub fn tap(&mut self, received: Instant) -> Option<f64> {
+        let now = received.saturating_duration_since(self.start).as_secs_f64();
         if self.taps.last().map_or(false, |&t| now - t > 2.0) {
             self.taps.clear();
         }

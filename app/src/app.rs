@@ -2,6 +2,7 @@
 //! the menus, the bars and incoming MIDI/OSC ask for.
 
 use crate::bars::MenuState;
+use crate::app_mappings::{self, Mappings};
 use crate::colours::{self, Scheme};
 use crate::dialogs::Dialogs;
 use crate::engine::{Engine, Plan};
@@ -107,6 +108,7 @@ pub enum Cmd {
     SaveAsDefault,
     ResetDefault,
     Exit,
+    Quit,
     DeleteConnections,
     OrganisePatches,
     UserPresets,
@@ -125,6 +127,7 @@ pub enum Cmd {
     PlayPause,
     Rtz,
     TapTempo,
+    TimedTap(Instant),
 }
 
 impl From<AppCommand> for Cmd {
@@ -141,11 +144,15 @@ impl From<AppCommand> for Cmd {
 
 /// What the MIDI and OSC threads pass to the window (they feed the audio thread directly).
 pub enum Incoming {
-    Midi(Vec<u8>),
-    Osc { address: String, tags: String, args: Vec<osc::Arg> },
+    Midi(Vec<u8>, Instant),
+    Osc { address: String, tags: String, args: Vec<osc::Arg>, received: Instant },
+    Shortcut(Cmd),
+    CapturedKey(String),
 }
 
 pub struct App {
+    pub mappings: Mappings,
+    pub osc_addresses: std::collections::BTreeSet<String>,
     pub settings: Settings,
     pub scheme: Scheme,
     pub engine: Engine,
@@ -240,6 +247,8 @@ impl App {
         let scheme = crate::dialogs::load_scheme(&settings.colour_scheme).unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         let mut app = App {
+            mappings: Mappings::default(),
+            osc_addresses: Default::default(),
             settings,
             scheme,
             engine: Engine::new(),
@@ -284,6 +293,14 @@ impl App {
             cc.egui_ctx.set_embed_viewports(true);
         }
         if app.shot.is_none() {
+            match Mappings::load(&settings::dir(), &app.settings.app_mappings) {
+                Ok(mappings) => {
+                    app.mappings = mappings;
+                    app.settings.app_mappings.clear();
+                }
+                Err(e) => app.message("Application Mappings", &e.to_string()),
+            }
+            app_mappings::keyboard::install(app.hwnd, app.tx.clone(), &app.egui_ctx, &app.mappings);
             if let Err(e) = app.open_device() {
                 app.message("Audio Device Error", &e);
             }
@@ -590,7 +607,7 @@ impl App {
         if matches!(cmd, Cmd::Exit) && self.shot.is_none() && self.hide_to_tray() {
             return;
         }
-        if matches!(cmd, Cmd::New | Cmd::Open | Cmd::Exit) && self.dirty && self.shot.is_none() {
+        if matches!(cmd, Cmd::New | Cmd::Open | Cmd::Exit | Cmd::Quit) && self.dirty && self.shot.is_none() {
             self.dlg.confirm = Some(cmd);
             return;
         }
@@ -637,7 +654,7 @@ impl App {
             Cmd::ResetDefault => {
                 let _ = std::fs::remove_file(default_file());
             }
-            Cmd::Exit => {
+            Cmd::Exit | Cmd::Quit => {
                 self.allow_close = true;
                 self.egui_ctx.send_viewport_cmd(ViewportCommand::Close);
             }
@@ -685,8 +702,9 @@ impl App {
                 sh.playing.fetch_xor(true, Ordering::Relaxed);
             }
             Cmd::Rtz => sh.rtz.store(true, Ordering::Relaxed),
-            Cmd::TapTempo => {
-                if let Some(bpm) = self.tap.tap() {
+            Cmd::TapTempo | Cmd::TimedTap(_) => {
+                let time = if let Cmd::TimedTap(time) = cmd { time } else { Instant::now() };
+                if let Some(bpm) = self.tap.tap(time) {
                     self.set_tempo(bpm);
                 }
             }
@@ -784,7 +802,6 @@ impl App {
                         }
                     }
                 }
-                Action::DeleteConns => self.delete_selected(),
                 Action::SetProgram(id, k) => {
                     if let Some(p) = self.graph.node_mut(id).and_then(|n| n.plugin()) {
                         p.set_program(k);
@@ -803,16 +820,17 @@ impl App {
 
     // ---- MIDI and OSC arriving at the window ----
 
-    fn on_midi(&mut self, b: &[u8]) {
+    fn on_midi(&mut self, b: &[u8], received: Instant) {
         let Some(&s) = b.first() else { return };
         let ch = (s & 0x0F) + 1;
         match (s & 0xF0, b.len()) {
             (0xB0, 3..) => {
                 self.log(format!("MIDI CC message received: CC={} val={} chan={ch}", b[1], b[2]));
-                self.learn_cc(b[1]);
-                if b[2] > 0 {
-                    let hits: Vec<Cmd> = self.settings.app_mappings.iter().filter(|m| !m.osc && m.cc == b[1] && (m.channel == 0 || m.channel == ch)).map(|m| m.command.into()).collect();
-                    self.pending.extend(hits);
+                if self.dlg.app_draft.prompting() {
+                    self.dlg.app_draft.learn_cc(b[1]);
+                } else {
+                    self.learn_cc(b[1]);
+                    self.mappings.midi(b[1], ch, b[2], received, &mut self.pending);
                 }
             }
             (0x90, 3..) if b[2] > 0 => self.log(format!("MIDI Note On message received: note={} vel={} chan={ch}", b[1], b[2])),
@@ -844,39 +862,16 @@ impl App {
         }
     }
 
-    fn on_osc(&mut self, address: String, tags: String, args: Vec<osc::Arg>) {
+    fn on_osc(&mut self, address: String, tags: String, args: Vec<osc::Arg>, received: Instant) {
         let list = |f: &dyn Fn(&osc::Arg) -> Option<String>| args.iter().filter_map(f).collect::<Vec<_>>().join(",");
         let floats = list(&|a| if let osc::Arg::F(v) = a { Some(v.to_string()) } else { None });
         let ints = list(&|a| if let osc::Arg::I(v) = a { Some(v.to_string()) } else { None });
         let strs = list(&|a| if let osc::Arg::S(v) = a { Some(v.clone()) } else { None });
         self.log(format!("OSC Message received. address={address} typetag={tags} float value(s)={floats} int value(s)={ints} string value(s)={strs}"));
-        let v = args.iter().find_map(|a| a.value()).unwrap_or(1.0);
-        if v > 0.0 {
-            let hits: Vec<Cmd> = self.settings.app_mappings.iter().filter(|m| m.osc && m.address == address).map(|m| m.command.into()).collect();
-            self.pending.extend(hits);
+        if !self.dlg.app_draft.prompting() {
+            self.mappings.osc(&address, &args, received, &mut self.pending);
         }
-    }
-
-    fn shortcuts(&mut self, ctx: &Context) {
-        // A modal box (the organiser's "Select patch...") takes every key, as JUCE's modal loop does.
-        if ctx.wants_keyboard_input() || ctx.memory(|m| m.top_modal_layer().is_some()) || crate::subwin::modal() {
-            return;
-        }
-        let mut cmds = Vec::new();
-        ctx.input_mut(|i| {
-            for (m, k, c) in [
-                (Modifiers::COMMAND | Modifiers::SHIFT, Key::S, Cmd::SaveAs),
-                (Modifiers::COMMAND, Key::S, Cmd::Save),
-                (Modifiers::COMMAND, Key::N, Cmd::New),
-                (Modifiers::COMMAND, Key::O, Cmd::Open),
-                (Modifiers::NONE, Key::F1, Cmd::Documentation),
-            ] {
-                if i.consume_key(m, k) {
-                    cmds.push(c);
-                }
-            }
-        });
-        self.pending.extend(cmds);
+        self.osc_addresses.insert(address);
     }
 
     fn startup(&mut self) {
@@ -947,8 +942,10 @@ impl eframe::App for App {
         }
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Incoming::Midi(b) => self.on_midi(&b),
-                Incoming::Osc { address, tags, args } => self.on_osc(address, tags, args),
+                Incoming::Midi(b, received) => self.on_midi(&b, received),
+                Incoming::Osc { address, tags, args, received } => self.on_osc(address, tags, args, received),
+                Incoming::Shortcut(cmd) => self.pending.push(cmd),
+                Incoming::CapturedKey(key) => self.dlg.app_draft.capture_key(key),
             }
         }
         self.engine.collect_garbage();
@@ -976,8 +973,7 @@ impl eframe::App for App {
         // The main window going to the back lets go of the keyboard, as the other windows do.
         crate::subwin::root_focus(ctx);
         // A prompt keeps the keys and clicks from the main window while it's open.
-        crate::subwin::set_modal(self.dlg.import.is_some() || self.dlg.presets.as_ref().is_some_and(|m| m.prompting()));
-        self.shortcuts(ctx);
+        crate::subwin::set_modal(self.dlg.import.is_some() || self.dlg.presets.as_ref().is_some_and(|m| m.prompting()) || self.dlg.app_draft.prompting());
         self.tray_frame(ctx);
 
         let bg = self.scheme.get(colours::WINDOW_BG);
@@ -994,6 +990,9 @@ impl eframe::App for App {
             self.menu_bar(ui, menu_r);
         });
         self.windows(ctx);
+        app_mappings::keyboard::enable(!crate::subwin::typing(ctx) && !crate::subwin::modal()
+            && !self.dlg.app_draft.prompting() && self.dlg.confirm.is_none()
+            && self.menu.open.is_none() && !self.combo_open && !ctx.memory(|m| m.any_popup_open() || m.top_modal_layer().is_some()));
         self.program_notice(ctx);
         for c in std::mem::take(&mut self.pending) {
             self.run(c);

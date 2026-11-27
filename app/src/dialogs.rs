@@ -7,7 +7,8 @@ use crate::colours::{self, draw, overlaid, Scheme};
 use crate::engine::{asio, wasapi};
 use crate::graph::NodeKind;
 use crate::plugins::PluginUi;
-use crate::settings::{self, AppCommand, AppMapping, AudioConfig, Settings};
+use crate::settings::{self, AudioConfig, Settings};
+use crate::app_mappings::editor::{MappingEditor, prompt_id};
 use crate::subwin::{self, Kind, Spec};
 use crate::widgets::{bold, font, scrollbar, text_at, text_fit};
 use egui::color_picker::{color_edit_button_srgba, Alpha};
@@ -28,15 +29,6 @@ pub struct ColourDraft {
 }
 
 #[derive(Default)]
-pub struct AppMapDraft {
-    pub osc: bool,
-    pub cc: u8,
-    pub channel: u8,
-    pub address: String,
-    pub command: usize,
-}
-
-#[derive(Default)]
 pub struct Dialogs {
     pub messages: Vec<(String, String)>,
     /// Counts the messages answered, so each one opens as a new window in the middle.
@@ -49,7 +41,7 @@ pub struct Dialogs {
     pub plugins: Option<crate::plugin_list::PluginListState>,
     pub colours: Option<ColourDraft>,
     pub app_maps: bool,
-    pub app_draft: AppMapDraft,
+    pub app_draft: MappingEditor,
     pub organiser: bool,
     /// The organiser's selected rows and in-place rename while it's open.
     pub organiser_state: crate::editors::OrganiserState,
@@ -293,6 +285,9 @@ impl App {
         }
         if let Some(m) = self.dlg.presets.as_ref().filter(|m| m.prompting() && subwin::shown(crate::editors::prompt_vid(m))) {
             blocked = vec![ViewportId::ROOT, crate::editors::presets_vid(m)];
+        }
+        if self.dlg.app_draft.prompting() && subwin::shown(prompt_id()) {
+            blocked.extend([ViewportId::ROOT, subwin::id("app_maps")]);
         }
         subwin::end_frame(ctx, &blocked);
     }
@@ -754,67 +749,6 @@ impl App {
         }
     }
 
-    fn app_maps_window(&mut self, ctx: &Context) {
-        let mut remove = None;
-        let mut add = None;
-        let maps = &self.settings.app_mappings;
-        let d = &mut self.dlg.app_draft;
-        let close = subwin::show(ctx, Spec::new(subwin::id("app_maps"), "Application Mappings", Kind::fit(480.0).sizable()), |ui| {
-            ui.label("MIDI CC messages or OSC addresses that run main window commands.");
-            Grid::new("app_maps").num_columns(4).striped(true).show(ui, |ui| {
-                for h in ["Source", "Channel", "Command", ""] {
-                    ui.strong(h);
-                }
-                ui.end_row();
-                for (k, m) in maps.iter().enumerate() {
-                    ui.label(if m.osc { format!("OSC {}", m.address) } else { format!("MIDI CC {}", m.cc) });
-                    ui.label(if m.osc { "-".into() } else if m.channel == 0 { "any".into() } else { m.channel.to_string() });
-                    ui.label(m.command.label());
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(k);
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut d.osc, false, "MIDI CC");
-                ui.radio_value(&mut d.osc, true, "OSC address");
-            });
-            ui.horizontal(|ui| {
-                if d.osc {
-                    ui.add(TextEdit::singleline(&mut d.address).hint_text("/pedalboard/next").desired_width(200.0));
-                } else {
-                    ui.label("CC:");
-                    ui.add(DragValue::new(&mut d.cc).range(0..=127));
-                    ui.label("Channel (0 = any):");
-                    ui.add(DragValue::new(&mut d.channel).range(0..=16));
-                }
-                ComboBox::from_id_salt("app_cmd").selected_text(AppCommand::ALL[d.command.min(4)].label()).show_ui(ui, |ui| {
-                    for (k, c) in AppCommand::ALL.iter().enumerate() {
-                        ui.selectable_value(&mut d.command, k, c.label());
-                    }
-                });
-                if ui.add_enabled(!d.osc || d.address.starts_with('/'), Button::new("Add")).clicked() {
-                    add = Some(AppMapping { osc: d.osc, cc: d.cc, channel: d.channel, address: d.address.trim().to_string(), command: AppCommand::ALL[d.command.min(4)] });
-                }
-            });
-        });
-        let mut changed = false;
-        if let Some(k) = remove {
-            self.settings.app_mappings.remove(k);
-            changed = true;
-        }
-        if let Some(m) = add {
-            self.settings.app_mappings.push(m);
-            changed = true;
-        }
-        if changed {
-            self.settings.save();
-        }
-        self.dlg.app_maps = !close;
-    }
-
     fn log_window(&mut self, ctx: &Context) {
         let mut clear = false;
         let log = &self.log;
@@ -860,6 +794,7 @@ impl App {
                     "Double-click an empty part of the pedalboard to add a built-in processor or a plugin.",
                     "Drag from an output pin to an input pin to connect two boxes. Click a cable to select it (Ctrl-click adds more) and press Delete to remove it.",
                     "Connect Midi Input or OSC Input to a box's param pin, then use the mappings button to tie controllers to its parameters.",
+                    "In Options > Application Mappings, click + beside a command to set a shortcut, learn a MIDI controller, or assign an OSC address. Click an assignment to remove it.",
                     "Switch patches with the patch selector or the - and + buttons; Edit > Organise patches renames and reorders them.",
                     "Options > Plugin List scans your VST and VST3 folders. Options > Audio Settings picks the device; ASIO with a small buffer gives the lowest latency.",
                     "The bypass button passes audio straight through a box; the cross removes it.",

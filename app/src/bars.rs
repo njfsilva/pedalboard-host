@@ -20,33 +20,33 @@ pub struct MenuState {
 }
 
 const MENUS: [&str; 4] = ["File", "Edit", "Options", "Help"];
-type Entry = (&'static str, Option<Cmd>, &'static str);
+type Entry = (&'static str, Option<Cmd>);
 
 const FILE: &[Entry] = &[
-    ("New", Some(Cmd::New), "Ctrl+N"),
-    ("Open...", Some(Cmd::Open), "Ctrl+O"),
-    ("Save", Some(Cmd::Save), "Ctrl+S"),
-    ("Save As...", Some(Cmd::SaveAs), "Ctrl+Shift+S"),
-    ("", None, ""),
-    ("Save As Default", Some(Cmd::SaveAsDefault), ""),
-    ("Reset Default", Some(Cmd::ResetDefault), ""),
-    ("", None, ""),
-    ("Exit", Some(Cmd::Exit), ""),
+    ("New", Some(Cmd::New)),
+    ("Open...", Some(Cmd::Open)),
+    ("Save", Some(Cmd::Save)),
+    ("Save As...", Some(Cmd::SaveAs)),
+    ("", None),
+    ("Save As Default", Some(Cmd::SaveAsDefault)),
+    ("Reset Default", Some(Cmd::ResetDefault)),
+    ("", None),
+    ("Exit", Some(Cmd::Exit)),
 ];
 const EDIT: &[Entry] = &[
-    ("Delete selected connection(s)", Some(Cmd::DeleteConnections), "Delete"),
-    ("", None, ""),
-    ("Organise patches", Some(Cmd::OrganisePatches), ""),
-    ("User Preset Management", Some(Cmd::UserPresets), ""),
+    ("Delete selected connection(s)", Some(Cmd::DeleteConnections)),
+    ("", None),
+    ("Organise patches", Some(Cmd::OrganisePatches)),
+    ("User Preset Management", Some(Cmd::UserPresets)),
 ];
 const OPTIONS: &[Entry] = &[
-    ("Misc Settings", Some(Cmd::MiscSettings), ""),
-    ("Audio Settings", Some(Cmd::AudioSettings), ""),
-    ("Plugin List", Some(Cmd::PluginList), ""),
-    ("Colour Schemes", Some(Cmd::ColourSchemes), ""),
-    ("Application Mappings", Some(Cmd::AppMappings), ""),
+    ("Misc Settings", Some(Cmd::MiscSettings)),
+    ("Audio Settings", Some(Cmd::AudioSettings)),
+    ("Plugin List", Some(Cmd::PluginList)),
+    ("Colour Schemes", Some(Cmd::ColourSchemes)),
+    ("Application Mappings", Some(Cmd::AppMappings)),
 ];
-const HELP: &[Entry] = &[("Documentation", Some(Cmd::Documentation), "F1"), ("Event Log", Some(Cmd::EventLog), ""), ("", None, ""), ("About", Some(Cmd::About), "")];
+const HELP: &[Entry] = &[("Documentation", Some(Cmd::Documentation)), ("Event Log", Some(Cmd::EventLog)), ("", None), ("About", Some(Cmd::About))];
 
 /// Baseline of text centred in `r` the way a JUCE label centres it.
 pub fn baseline(r: Rect, size: f32) -> f32 {
@@ -170,12 +170,12 @@ impl App {
         };
         let rows: Vec<Row> = list
             .iter()
-            .map(|(l, c, s)| {
+            .map(|(l, c)| {
                 let enabled = match c {
                     Some(Cmd::DeleteConnections) => !self.field.selected.is_empty(),
                     _ => true,
                 };
-                (l.to_string(), s.to_string(), enabled, false)
+                (l.to_string(), c.map_or_else(String::new, |cmd| self.mappings.menu_keys(cmd)), enabled, false)
             })
             .collect();
         let (chosen, popup) = popup_list(ui, Id::new("menu_popup"), pos2(items[open].left(), r.bottom()), None, &rows, &self.scheme);

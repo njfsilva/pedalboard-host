@@ -8,6 +8,7 @@
 //!   --scan-plugin <file>     (internal) describe one plugin file as JSON, used by the scanner
 
 mod app;
+mod app_mappings;
 mod bars;
 mod builtins;
 mod colours;

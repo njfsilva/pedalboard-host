@@ -424,7 +424,7 @@ pub fn show(ctx: &Context, spec: Spec, mut add: impl FnMut(&mut Ui)) -> bool {
 }
 
 /// Whether a text box has the keyboard in this window.
-fn typing(ctx: &Context) -> bool {
+pub fn typing(ctx: &Context) -> bool {
     ctx.memory(|m| m.focused()).is_some_and(|id| TextEdit::load_state(ctx, id).is_some())
 }
 
