@@ -71,6 +71,9 @@ pub struct Settings {
     pub ignore_pin_names: bool,
     pub midi_program_change: bool,
     pub mmc_transport: bool,
+    // Old settings saved false even when the tray preference had never been touched.
+    #[serde(default)]
+    tray_settings_version: u8,
     pub use_tray_icon: bool,
     pub start_in_tray: bool,
     pub fixed_size_windows: bool,
@@ -93,7 +96,7 @@ pub struct Settings {
 }
 
 impl Default for Settings {
-    /// The defaults the original reads its settings with (see MECHANICS.md, Misc settings).
+    /// The original defaults, with the tray icon enabled for the rebuilt host.
     fn default() -> Self {
         Settings {
             loop_patches: true,
@@ -101,7 +104,8 @@ impl Default for Settings {
             ignore_pin_names: false,
             midi_program_change: false,
             mmc_transport: false,
-            use_tray_icon: false,
+            tray_settings_version: 1,
+            use_tray_icon: true,
             start_in_tray: false,
             fixed_size_windows: true,
             pdl_audio_settings: false,
@@ -134,10 +138,22 @@ pub fn dir() -> PathBuf {
 }
 
 impl Settings {
+    fn from_json(text: &str) -> serde_json::Result<Self> {
+        let document: serde_json::Value = serde_json::from_str(text)?;
+        let old_icon_enabled = document.get("use_tray_icon").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut settings: Self = serde_json::from_value(document)?;
+        if settings.tray_settings_version == 0 {
+            settings.start_in_tray &= old_icon_enabled;
+            settings.use_tray_icon = true;
+            settings.tray_settings_version = 1;
+        }
+        Ok(settings)
+    }
+
     pub fn load() -> Settings {
         std::fs::read_to_string(dir().join("settings.json"))
             .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .and_then(|t| Self::from_json(&t).ok())
             .unwrap_or_default()
     }
 
@@ -147,5 +163,24 @@ impl Settings {
         if let Ok(t) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(d.join("settings.json"), t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_enables_the_icon_once_and_remembers_later_choices() {
+        let mut settings = Settings::from_json(r#"{"use_tray_icon":false,"start_in_tray":true,"osc_port":7777}"#).unwrap();
+        assert!(settings.use_tray_icon && !settings.start_in_tray);
+        assert_eq!(settings.osc_port, 7777);
+        settings.use_tray_icon = false;
+        assert!(!Settings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap().use_tray_icon);
+        let hidden = Settings::from_json(r#"{"use_tray_icon":true,"start_in_tray":true}"#).unwrap();
+        assert!(hidden.use_tray_icon && hidden.start_in_tray);
+        assert!(!Settings::from_json(r#"{"start_in_tray":true}"#).unwrap().start_in_tray);
+        assert!(Settings::default().use_tray_icon);
+        assert!(Settings::from_json("{}").unwrap().use_tray_icon);
     }
 }

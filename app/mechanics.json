@@ -247,7 +247,8 @@
     {"name": "loop patches default", "group": "settings", "value": true, "source": "settings window 0x140084aa4"},
     {"name": "midi program change default", "group": "settings", "value": false, "source": "settings window 0x140084907, runtime read 0x140054c59"},
     {"name": "mmc transport default", "group": "settings", "value": false, "source": "settings window 0x14008497f, runtime read 0x140054b73"},
-    {"name": "tray icon default", "group": "settings", "value": false, "source": "settings window 0x140084cd9, runtime read 0x140019bba"},
+    {"name": "original tray icon default", "group": "settings", "value": false, "source": "settings window 0x140084cd9, runtime read 0x140019bba"},
+    {"name": "tray icon default", "group": "settings", "value": true, "source": "requested launch behaviour for the rebuild"},
     {"name": "start in tray default", "group": "settings", "value": false, "source": "settings window 0x140084d64, runtime read 0x140019c81"},
     {"name": "auto mappings window default", "group": "settings", "value": true, "source": "settings window 0x1400849f7, runtime read 0x140078341"},
     {"name": "windows on top default", "group": "settings", "value": false, "source": "settings window 0x140084ae7, runtime read 0x140075bf4"},
@@ -558,6 +559,8 @@
     {"name": "save prompt before New and Open", "group": "save prompt", "value": true, "estimated": true},
 
     {"name": "start hidden", "group": "tray", "value": "tray icon and start in tray both on", "source": "App::initialise 0x140019980"},
+    {"name": "restore icon when the taskbar is recreated", "group": "tray", "value": true, "source": "functions 0x140235e10 and 0x140236280"},
+    {"name": "tray registration retry interval", "group": "tray", "value": 2000, "unit": "ms", "estimated": true},
     {"name": "tray tooltip in the original", "group": "tray", "value": "Pedalboard 2", "source": "TrayIcon 0x1400891a0"},
     {"name": "tray tooltip", "group": "tray", "value": "Pedalboard Host", "estimated": true},
     {"name": "tray double-click", "group": "tray", "value": "shows or hides the main window", "source": "mouseDoubleClick 0x140089830"},
