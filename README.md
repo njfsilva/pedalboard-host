@@ -9,7 +9,7 @@
 ![Plugins](https://img.shields.io/badge/plugins-VST2%20%7C%20VST3-purple)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-based live effects host. It keeps the original's look, file formats and behaviour. It adds **VST3 support** and an audio path built for **low latency** with ASIO.
+Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-based live effects host. It keeps the original's look, file formats and behaviour. It adds **VST3 support** and an audio path built for **low latency** with ASIO. A core intention of the project is to preserve a simple, focused UI while keeping resource use to a minimum, which is why the project is built with rust.
 
 <p align="center">
   <img src="docs/screenshot.png" alt="Pedalboard Host main window" width="800">
