@@ -527,50 +527,56 @@ impl App {
         let info = self.engine.info.clone();
         let Some(d) = self.dlg.audio.as_mut() else { return };
         let close = subwin::show(ctx, Spec::new(subwin::id("audio"), "Audio Settings", Kind::fit(480.0).sizable()).escape(), |ui| {
-            let asio = d.cfg.backend == "ASIO";
-            let same = info.as_ref().is_some_and(|i| i.backend == d.cfg.backend && (d.cfg.device.is_empty() || i.name == d.cfg.device));
+            let mut input_asio = d.cfg.input_asio();
+            let mut output_asio = d.cfg.output_asio();
+            let applied = &self.settings.audio;
+            let matches_route = |cfg: &AudioConfig| info.is_some() && cfg.backend == applied.backend
+                && cfg.input_asio() == applied.input_asio() && cfg.device == applied.device
+                && (cfg.input_asio() && cfg.output_asio() || cfg.input_device == applied.input_device);
             Grid::new("audio_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Audio system:");
-                ComboBox::from_id_salt("backend").selected_text(&d.cfg.backend).width(300.0).show_ui(ui, |ui| {
-                    for b in ["Windows Audio", "ASIO"] {
-                        if ui.selectable_value(&mut d.cfg.backend, b.to_string(), b).changed() {
-                            d.cfg.device.clear();
-                            d.cfg.input_device.clear();
+                for (label, selected) in [("Input system", &mut input_asio), ("Output system", &mut output_asio)] {
+                    ui.label(label);
+                    let windows = "Windows Audio (WASAPI)";
+                    ComboBox::from_id_salt(label).selected_text(if *selected { "ASIO" } else { windows }).width(300.0).show_ui(ui, |ui| {
+                        ui.selectable_value(selected, false, windows);
+                        ui.selectable_value(selected, true, "ASIO");
+                    });
+                    ui.end_row();
+                }
+                if (input_asio, output_asio) != (d.cfg.input_asio(), d.cfg.output_asio()) {
+                    d.cfg.set_systems(input_asio, output_asio);
+                }
+                let duplex_asio = input_asio && output_asio;
+                let devices = [
+                    ("Input device", &mut d.cfg.input_device, input_asio, if input_asio { &d.asio } else { &d.ins }),
+                    (if duplex_asio { "ASIO driver" } else { "Output device" }, &mut d.cfg.device, output_asio, if output_asio { &d.asio } else { &d.outs }),
+                ];
+                for (label, selected, asio, names) in devices {
+                    if label == "Input device" && duplex_asio {
+                        continue;
+                    }
+                    ui.label(label);
+                    let shown = if selected.is_empty() { "(default device)" } else { selected.as_str() };
+                    ComboBox::from_id_salt(label).selected_text(shown).width(300.0).show_ui(ui, |ui| {
+                        ui.selectable_value(selected, String::new(), "(default device)");
+                        if label == "Input device" && !asio {
+                            ui.selectable_value(selected, wasapi::NO_INPUT.to_string(), wasapi::NO_INPUT);
                         }
-                    }
-                });
-                ui.end_row();
-                ui.label(if asio { "ASIO driver:" } else { "Output:" });
-                let shown = if d.cfg.device.is_empty() { "(default device)".to_string() } else { d.cfg.device.clone() };
-                ComboBox::from_id_salt("device").selected_text(shown).width(300.0).show_ui(ui, |ui| {
-                    if !asio {
-                        ui.selectable_value(&mut d.cfg.device, String::new(), "(default device)");
-                    }
-                    for n in if asio { &d.asio } else { &d.outs } {
-                        ui.selectable_value(&mut d.cfg.device, n.clone(), n);
-                    }
-                    if asio && d.asio.is_empty() {
-                        ui.label("No ASIO drivers are installed.");
-                    }
-                });
-                ui.end_row();
-                if !asio {
-                    ui.label("Input:");
-                    let shown = if d.cfg.input_device.is_empty() { "(default device)".to_string() } else { d.cfg.input_device.clone() };
-                    ComboBox::from_id_salt("input").selected_text(shown).width(300.0).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.cfg.input_device, String::new(), "(default device)");
-                        ui.selectable_value(&mut d.cfg.input_device, wasapi::NO_INPUT.to_string(), wasapi::NO_INPUT);
-                        for n in &d.ins {
-                            ui.selectable_value(&mut d.cfg.input_device, n.clone(), n);
+                        for n in names {
+                            ui.selectable_value(selected, n.clone(), n);
+                        }
+                        if asio && names.is_empty() {
+                            ui.label("No ASIO drivers are installed.");
                         }
                     });
                     ui.end_row();
                 }
+                let same = matches_route(&d.cfg);
                 let rates: Vec<f64> = match &info {
                     Some(i) if same && !i.rates.is_empty() => i.rates.clone(),
                     _ => vec![44100.0, 48000.0, 88200.0, 96000.0],
                 };
-                ui.label("Sample rate:");
+                ui.label(if input_asio != output_asio { "ASIO sample rate" } else { "Sample rate" });
                 let shown = if d.cfg.sample_rate > 0.0 { format!("{} Hz", d.cfg.sample_rate) } else { "(device default)".into() };
                 ComboBox::from_id_salt("rate").selected_text(shown).width(300.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut d.cfg.sample_rate, 0.0, "(device default)");
@@ -583,8 +589,13 @@ impl App {
                     Some(i) if same && !i.blocks.is_empty() => i.blocks.clone(),
                     _ => vec![32, 64, 128, 256, 512, 1024],
                 };
-                let sr = info.as_ref().map_or(48000.0, |i| i.sample_rate).max(1.0);
-                ui.label("Buffer size:");
+                let sr = if d.cfg.sample_rate > 0.0 { d.cfg.sample_rate } else {
+                    info.as_ref().filter(|_| same).map_or(48000.0, |i| match &i.mixed {
+                        Some(t) if input_asio => t.input_rate,
+                        _ => i.sample_rate,
+                    })
+                };
+                ui.label(if input_asio != output_asio { "ASIO buffer size" } else { "Buffer size" });
                 let shown = if d.cfg.buffer_size > 0 { format!("{} samples", d.cfg.buffer_size) } else { "(device default)".into() };
                 ComboBox::from_id_salt("block").selected_text(shown).width(300.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut d.cfg.buffer_size, 0, "(device default)");
@@ -594,7 +605,8 @@ impl App {
                 });
                 ui.end_row();
             });
-            if asio && ui.add_enabled(same, Button::new("Open the driver's control panel")).clicked() {
+            let same = matches_route(&d.cfg);
+            if (input_asio || output_asio) && ui.add_enabled(same, Button::new("Open the driver's control panel")).clicked() {
                 panel = true;
             }
             if let Some(i) = info.as_ref().filter(|_| same) {
@@ -618,13 +630,21 @@ impl App {
                 }
                 ui.separator();
                 let ms = |n: f64| n * 1000.0 / i.sample_rate.max(1.0);
-                ui.label(format!("Running: {} ({}), {} Hz, {} samples per buffer", i.name, i.backend, i.sample_rate, i.block));
-                ui.label(format!(
-                    "Latency reported by the device: input {:.1} ms, output {:.1} ms; round trip about {:.1} ms",
-                    ms(i.in_latency as f64),
-                    ms(i.out_latency as f64),
-                    ms((i.in_latency + i.out_latency) as f64 + i.block as f64)
-                ));
+                if let Some(timing) = &i.mixed {
+                    ui.label(format!("Running {} ({})", i.name, i.backend));
+                    ui.label(format!("Input {:.0} Hz, output {:.0} Hz", timing.input_rate, i.sample_rate));
+                    if let Some(d) = self.latency.devices {
+                        ui.label(format!("Estimated input-to-output latency  {:.2} ms", self.latency.total_ms()));
+                        ui.label(format!("Input {:.2} ms  +  bridge {:.2} ms  +  plug-ins {:.2} ms  +  output {:.2} ms",
+                            d.input_ms, d.bridge_ms, self.latency.plugin_ms, d.output_ms));
+                    }
+                } else {
+                    ui.label(format!("Running: {} ({}), {} Hz, {} samples per buffer", i.name, i.backend, i.sample_rate, i.block));
+                    ui.label(format!(
+                        "Latency reported by the device: input {:.1} ms, output {:.1} ms; round trip about {:.1} ms",
+                        ms(i.in_latency as f64), ms(i.out_latency as f64), ms((i.in_latency + i.out_latency) as f64 + i.block as f64)
+                    ));
+                }
             } else {
                 ui.label("Press Apply to open this device and see its channels.");
             }
@@ -656,16 +676,31 @@ impl App {
             self.engine.control_panel();
         }
         if apply {
+            let previous = self.settings.audio.clone();
+            let was_running = self.engine.running;
             if let Some(d) = &self.dlg.audio {
                 self.settings.audio = d.cfg.clone();
                 self.settings.midi_inputs = d.midi_on.clone();
             }
-            if let Err(e) = self.open_device() {
-                self.message("Audio Device Error", &e);
-            }
-            if let (Some(d), Some(i)) = (self.dlg.audio.as_mut(), &self.engine.info) {
-                d.cfg.output_channels = i.active_outs.clone();
-                d.cfg.input_channels = i.active_ins.clone();
+            match self.open_device() {
+                Ok(()) => {
+                    if let (Some(d), Some(i)) = (self.dlg.audio.as_mut(), &self.engine.info) {
+                        d.cfg.output_channels = i.active_outs.clone();
+                        if !i.in_names.is_empty() {
+                            d.cfg.input_channels = i.active_ins.clone();
+                        }
+                        self.settings.audio = d.cfg.clone();
+                    }
+                }
+                Err(e) => {
+                    self.message("Audio Device Error", &e);
+                    if was_running && self.settings.audio != previous {
+                        self.settings.audio = previous;
+                        if let Err(e) = self.open_device() {
+                            self.message("Audio Device Error", &format!("Could not restore the previous audio devices. {e}"));
+                        }
+                    }
+                }
             }
             self.open_midi();
             self.settings.save();

@@ -5,7 +5,7 @@ use crate::bars::MenuState;
 use crate::app_mappings::{self, Mappings};
 use crate::colours::{self, Scheme};
 use crate::dialogs::Dialogs;
-use crate::engine::latency::{LatencyRoutes, NodeLatency};
+use crate::engine::latency::{LatencyReading, LatencyRoutes, NodeLatency};
 use crate::engine::{Engine, Plan};
 use crate::field::{Action, Field};
 use crate::graph::{Ctx, Graph, NodeKind};
@@ -162,6 +162,7 @@ pub struct App {
     latency_routes: LatencyRoutes,
     next_latency_refresh: Instant,
     pub latency_text: String,
+    pub latency: LatencyReading,
     pub field: Field,
     pub patches: Vec<Patch>,
     pub current: usize,
@@ -222,20 +223,25 @@ fn chans_from(s: &str) -> Vec<u32> {
 }
 
 fn device_el(a: &AudioConfig) -> El {
-    El::new("DEVICESETUP")
+    let mut el = El::new("DEVICESETUP")
         .attr("deviceType", &a.backend)
         .attr("audioOutputDeviceName", &a.device)
         .attr("audioInputDeviceName", &a.input_device)
         .attr("audioDeviceRate", a.sample_rate)
         .attr("audioDeviceBufferSize", a.buffer_size)
         .attr("audioDeviceInChans", chan_bits(&a.input_channels))
-        .attr("audioDeviceOutChans", chan_bits(&a.output_channels))
+        .attr("audioDeviceOutChans", chan_bits(&a.output_channels));
+    if !a.input_backend.is_empty() {
+        el = el.attr("inputDeviceType", &a.input_backend);
+    }
+    el
 }
 
 fn device_from(e: &El) -> AudioConfig {
     let s = |k: &str, d: &str| e.get(k).unwrap_or(d).to_string();
     AudioConfig {
         backend: s("deviceType", "Windows Audio"),
+        input_backend: s("inputDeviceType", ""),
         device: s("audioOutputDeviceName", ""),
         input_device: s("audioInputDeviceName", ""),
         sample_rate: e.get_f("audioDeviceRate", 0.0),
@@ -261,6 +267,7 @@ impl App {
             latency_routes: LatencyRoutes::default(),
             next_latency_refresh: Instant::now(),
             latency_text: String::new(),
+            latency: LatencyReading::default(),
             field: Field::default(),
             patches: vec![Patch::untitled(120.0)],
             current: 0,
@@ -356,8 +363,11 @@ impl App {
         if now >= self.next_latency_refresh {
             let nodes: std::collections::HashMap<_, _> = self.graph.nodes.iter().map(|n| (n.id, n)).collect();
             let samples = self.latency_routes.output_samples(|id| nodes.get(&id).map_or(NodeLatency::Silent, |n| n.latency()));
-            let ms = samples as f64 * 1000.0 / self.engine.sample_rate();
-            self.latency_text = format!("Latency: {ms:.2} ms");
+            self.latency = LatencyReading {
+                plugin_ms: samples as f64 * 1000.0 / self.engine.sample_rate(),
+                devices: self.engine.mixed_delay(),
+            };
+            self.latency_text = format!("Latency: {:.2} ms", self.latency.total_ms());
             self.next_latency_refresh = now + LATENCY_REFRESH;
         }
         if !self.engine.running {
@@ -1071,6 +1081,27 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_devices_survive_settings_and_patch_round_trips() {
+        let mut cfg: AudioConfig = serde_json::from_str(r#"{"backend":"ASIO","device":"Interface"}"#).unwrap();
+        assert!(cfg.input_asio() && cfg.output_asio());
+        let legacy = device_from(&device_el(&cfg));
+        assert_eq!(legacy, cfg);
+        cfg.set_systems(true, false);
+        assert_eq!(cfg.input_device, "Interface");
+        cfg.device = "Speakers".into();
+        cfg.input_channels = vec![1, 3];
+        assert_eq!(device_from(&device_el(&cfg)), cfg);
+        assert_eq!(serde_json::from_str::<AudioConfig>(&serde_json::to_string(&cfg).unwrap()).unwrap(), cfg);
+        cfg.set_systems(true, true);
+        assert_eq!(cfg.device, "Interface");
+        cfg.set_systems(false, true);
+        cfg.input_device = "Microphone".into();
+        assert_eq!(device_from(&device_el(&cfg)), cfg);
+        let legacy = device_from(&El::new("DEVICESETUP").attr("deviceType", "Windows Audio"));
+        assert!(!legacy.input_asio() && !legacy.output_asio());
+    }
 
     #[test]
     fn a_restart_follows_half_a_second_after_the_last_request() {

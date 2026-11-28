@@ -2,12 +2,13 @@
 //! The driver's bufferSwitch callback converts samples in place and runs the patch straight away,
 //! with no extra buffering, so the latency is exactly the driver's buffer size.
 
-use super::{AudioRuntime, DeviceInfo};
+use super::{bridge, AudioRuntime, DeviceInfo};
 use crate::settings::AudioConfig;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[repr(C)]
 struct IAsio {
@@ -104,10 +105,25 @@ struct CbState {
     out_ptrs: Vec<*mut f32>,
     runtime: Arc<Mutex<AudioRuntime>>,
     post_output: bool,
+    route: CallbackRoute,
+}
+
+enum CallbackRoute {
+    Direct,
+    Capture(bridge::Writer),
+    Playback(bridge::Reader),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Use {
+    Duplex,
+    Capture,
+    Playback,
 }
 
 static STATE: AtomicPtr<CbState> = AtomicPtr::new(null_mut());
 static RESET: AtomicBool = AtomicBool::new(false);
+static LATENCY_CHANGED: AtomicBool = AtomicBool::new(false);
 
 pub fn reset_requested() -> bool {
     RESET.swap(false, Ordering::Relaxed)
@@ -122,8 +138,19 @@ extern "C" fn buffer_switch(index: i32, _direct: i32) {
     let half = (index & 1) as usize;
     let n_in = st.in_types.len();
     let n = st.block;
+    let callback_time = match st.route {
+        CallbackRoute::Direct => None,
+        _ => Some(Instant::now()),
+    };
     for i in 0..n_in {
         unsafe { read_samples(st.in_types[i], st.bufs[i].buffers[half] as *const u8, &mut st.scratch_in[i][..n]) };
+    }
+    if let CallbackRoute::Capture(writer) = &mut st.route {
+        writer.write(n, callback_time.unwrap(), |f, ch| st.scratch_in[ch][f]);
+        return;
+    }
+    if let CallbackRoute::Playback(reader) = &mut st.route {
+        reader.read(&mut st.scratch_in, n, callback_time.unwrap());
     }
     match st.runtime.try_lock() {
         Ok(mut rt) => unsafe { rt.process(&st.in_ptrs, &st.out_ptrs, n) },
@@ -163,7 +190,10 @@ extern "C" fn asio_message(selector: i32, value: i32, _msg: *mut c_void, _opt: *
             RESET.store(true, Ordering::Relaxed);
             1
         }
-        LATENCIES_CHANGED => 1,
+        LATENCIES_CHANGED => {
+            LATENCY_CHANGED.store(true, Ordering::Relaxed);
+            1
+        }
         _ => 0,
     }
 }
@@ -281,16 +311,17 @@ impl AsioDevice {
         &*(*self.driver).vtbl
     }
 
-    pub fn open(cfg: &AudioConfig, hwnd: isize, runtime: Arc<Mutex<AudioRuntime>>) -> Result<(AsioDevice, DeviceInfo), String> {
+    pub fn open(cfg: &AudioConfig, usage: Use, hwnd: isize, runtime: Arc<Mutex<AudioRuntime>>) -> Result<(AsioDevice, DeviceInfo), String> {
         use windows_sys::core::GUID;
         use windows_sys::Win32::System::Com::*;
         let drivers = list_drivers();
-        let (name, clsid_text) = drivers
-            .iter()
-            .find(|(n, _)| *n == cfg.device)
-            .or(drivers.first())
-            .cloned()
-            .ok_or("No ASIO drivers are installed.")?;
+        let selected = if usage == Use::Capture { &cfg.input_device } else { &cfg.device };
+        let driver = drivers.iter().find(|(n, _)| n == selected);
+        let (name, clsid_text) = if selected.is_empty() || usage == Use::Duplex {
+            driver.or(drivers.first()).ok_or("No ASIO drivers are installed.")?
+        } else {
+            driver.ok_or_else(|| format!("ASIO driver \"{selected}\" is unavailable."))?
+        }.clone();
         unsafe {
             CoInitializeEx(null(), COINIT_APARTMENTTHREADED as _);
             let mut clsid = GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] };
@@ -377,20 +408,27 @@ impl AsioDevice {
                 let v: Vec<u32> = want.iter().copied().filter(|&c| (c as i32) < total).collect();
                 if v.is_empty() && want.is_empty() { Vec::new() } else if v.is_empty() { (0..total.min(2) as u32).collect() } else { v }
             };
-            let active_ins = pick(&cfg.input_channels, ni);
-            let active_outs = pick(&cfg.output_channels, no);
-            let mut bufs: Vec<BufferInfo> = active_ins
+            let active_ins = if usage == Use::Playback { Vec::new() } else { pick(&cfg.input_channels, ni) };
+            let active_outs = if usage == Use::Capture { Vec::new() } else { pick(&cfg.output_channels, no) };
+            if usage == Use::Capture && ni <= 0 || usage == Use::Playback && no <= 0 {
+                return Err(format!("The ASIO driver \"{name}\" has no channels in the selected direction."));
+            }
+            // ASIO needs at least one hardware buffer to clock callbacks even when all
+            // channels on its side of a mixed route are unchecked.
+            let hw_ins = if usage == Use::Capture && active_ins.is_empty() { &[0][..] } else { &active_ins };
+            let hw_outs = if usage == Use::Playback && active_outs.is_empty() { &[0][..] } else { &active_outs };
+            let mut bufs: Vec<BufferInfo> = hw_ins
                 .iter()
                 .map(|&c| BufferInfo { is_input: 1, channel: c as i32, buffers: [null_mut(); 2] })
-                .chain(active_outs.iter().map(|&c| BufferInfo { is_input: 0, channel: c as i32, buffers: [null_mut(); 2] }))
+                .chain(hw_outs.iter().map(|&c| BufferInfo { is_input: 0, channel: c as i32, buffers: [null_mut(); 2] }))
                 .collect();
             if bufs.is_empty() {
                 return Err("Choose at least one ASIO channel.".into());
             }
-            let in_types: Vec<i32> = active_ins.iter().map(|&c| chan_name(true, c as i32).1).collect();
-            let out_types: Vec<i32> = active_outs.iter().map(|&c| chan_name(false, c as i32).1).collect();
-            let mut scratch_in: Vec<Vec<f32>> = vec![vec![0.0; block]; active_ins.len()];
-            let mut scratch_out: Vec<Vec<f32>> = vec![vec![0.0; block]; active_outs.len()];
+            let in_types: Vec<i32> = hw_ins.iter().map(|&c| chan_name(true, c as i32).1).collect();
+            let out_types: Vec<i32> = hw_outs.iter().map(|&c| chan_name(false, c as i32).1).collect();
+            let mut scratch_in: Vec<Vec<f32>> = vec![vec![0.0; block]; hw_ins.len()];
+            let mut scratch_out: Vec<Vec<f32>> = vec![vec![0.0; block]; hw_outs.len()];
             let in_ptrs = scratch_in.iter_mut().map(|b| b.as_ptr()).collect();
             let out_ptrs = scratch_out.iter_mut().map(|b| b.as_mut_ptr()).collect();
             if (vt.create_buffers)(dev.driver, bufs.as_mut_ptr(), bufs.len() as i32, block as i32, &CALLBACKS) != 0 {
@@ -398,7 +436,7 @@ impl AsioDevice {
             }
             let (mut il, mut ol) = (0, 0);
             (vt.get_latencies)(dev.driver, &mut il, &mut ol);
-            let post_output = (vt.output_ready)(dev.driver) == 0;
+            let post_output = !hw_outs.is_empty() && (vt.output_ready)(dev.driver) == 0;
             dev.state = Some(Box::new(CbState {
                 driver: dev.driver,
                 bufs,
@@ -411,6 +449,7 @@ impl AsioDevice {
                 out_ptrs,
                 runtime,
                 post_output,
+                route: CallbackRoute::Direct,
             }));
             let info = DeviceInfo {
                 name,
@@ -425,9 +464,21 @@ impl AsioDevice {
                 blocks,
                 in_latency: il.max(0) as u32,
                 out_latency: ol.max(0) as u32,
+                mixed: None,
             };
             Ok((dev, info))
         }
+    }
+
+    pub fn capture_to(&mut self, writer: bridge::Writer) {
+        self.state.as_mut().unwrap().route = CallbackRoute::Capture(writer);
+    }
+
+    pub fn render_from(&mut self, reader: bridge::Reader, channels: usize) {
+        let st = self.state.as_mut().unwrap();
+        st.scratch_in = vec![vec![0.0; st.block]; channels];
+        st.in_ptrs = st.scratch_in.iter().map(|ch| ch.as_ptr()).collect();
+        st.route = CallbackRoute::Playback(reader);
     }
 
     pub fn start(&mut self) -> Result<(), String> {
@@ -445,6 +496,16 @@ impl AsioDevice {
 
     pub fn control_panel(&self) {
         unsafe { (self.vt().control_panel)(self.driver) };
+    }
+
+    /// Query the driver on the UI thread after its callback reports a change.
+    pub fn updated_latencies(&self) -> Option<(u32, u32)> {
+        if !LATENCY_CHANGED.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        let (mut input, mut output) = (0, 0);
+        let result = unsafe { (self.vt().get_latencies)(self.driver, &mut input, &mut output) };
+        (result == 0).then_some((input.max(0) as u32, output.max(0) as u32))
     }
 }
 

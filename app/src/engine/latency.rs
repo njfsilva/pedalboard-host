@@ -1,5 +1,17 @@
 use super::{Plan, StepKind};
 
+#[derive(Default)]
+pub struct LatencyReading {
+    pub plugin_ms: f64,
+    pub devices: Option<super::bridge::Delay>,
+}
+
+impl LatencyReading {
+    pub fn total_ms(&self) -> f64 {
+        self.devices.map_or(self.plugin_ms, |d| d.total_ms(self.plugin_ms))
+    }
+}
+
 /// How a processor passes delay from its inputs to its outputs.
 pub enum NodeLatency {
     Process { samples: u32, generates_audio: bool },

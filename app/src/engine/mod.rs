@@ -6,7 +6,9 @@
 //! dropped there.
 
 pub mod asio;
+pub mod bridge;
 pub mod latency;
+mod mixed;
 pub mod wasapi;
 
 use crate::settings::AudioConfig;
@@ -575,11 +577,13 @@ pub struct DeviceInfo {
     pub blocks: Vec<u32>,
     pub in_latency: u32,
     pub out_latency: u32,
+    pub mixed: Option<Arc<bridge::Timing>>,
 }
 
 pub enum Device {
     Asio(asio::AsioDevice),
     Cpal(wasapi::CpalDevice),
+    Mixed(mixed::MixedDevice),
 }
 
 pub struct Engine {
@@ -652,11 +656,21 @@ impl Engine {
         f32::from_bits(self.shared.cpu.load(Ordering::Relaxed))
     }
 
+    pub fn mixed_delay(&self) -> Option<bridge::Delay> {
+        match self.device.as_ref()? {
+            Device::Mixed(d) => d.delay(self.info.as_ref()?),
+            _ => None,
+        }
+    }
+
     /// Opens (but doesn't start) the configured device.
     pub fn open(&mut self, cfg: &AudioConfig, hwnd: isize) -> Result<DeviceInfo, String> {
-        self.stop();
-        let (dev, info) = if cfg.backend == "ASIO" {
-            let (d, i) = asio::AsioDevice::open(cfg, hwnd, self.runtime.clone())?;
+        self.close();
+        let (dev, info) = if cfg.input_asio() != cfg.output_asio() {
+            let (d, i) = mixed::MixedDevice::open(cfg, hwnd, self.runtime.clone())?;
+            (Device::Mixed(d), i)
+        } else if cfg.output_asio() {
+            let (d, i) = asio::AsioDevice::open(cfg, asio::Use::Duplex, hwnd, self.runtime.clone())?;
             (Device::Asio(d), i)
         } else {
             let (d, i) = wasapi::CpalDevice::open(cfg, self.runtime.clone())?;
@@ -674,9 +688,13 @@ impl Engine {
         let r = match self.device.as_mut() {
             Some(Device::Asio(d)) => d.start(),
             Some(Device::Cpal(d)) => d.start(),
+            Some(Device::Mixed(d)) => d.start(),
             None => Err("No audio device is open.".into()),
         };
         self.running = r.is_ok();
+        if r.is_err() {
+            self.close();
+        }
         r
     }
 
@@ -692,8 +710,10 @@ impl Engine {
     }
 
     pub fn control_panel(&self) {
-        if let Some(Device::Asio(d)) = &self.device {
-            d.control_panel();
+        match &self.device {
+            Some(Device::Asio(d)) => d.control_panel(),
+            Some(Device::Mixed(d)) => d.asio.control_panel(),
+            _ => {}
         }
     }
 
@@ -701,6 +721,7 @@ impl Engine {
         match &self.device {
             Some(Device::Asio(_)) => asio::reset_requested(),
             Some(Device::Cpal(d)) => d.failed(),
+            Some(Device::Mixed(d)) => d.device_lost(),
             None => false,
         }
     }

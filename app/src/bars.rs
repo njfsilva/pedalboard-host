@@ -298,7 +298,11 @@ impl App {
         let latency_rect = at(cpu_left - latency_width, h - 33.0, latency_width, 24.0);
         label(ui, latency_rect, &self.latency_text);
         ui.interact(latency_rect, Id::new("chain_latency"), Sense::hover())
-            .on_hover_text("Plug-in delay on the longest audio path to the output. Excludes audio device latency.");
+            .on_hover_text(if self.latency.devices.is_some() {
+                "Estimated input-to-output latency, including both devices, buffering between them and plug-ins on the longest connected path."
+            } else {
+                "Plug-in delay on the longest audio path to the output."
+            });
         label(ui, at(cpu_left, h - 33.0, 78.0, 24.0), "CPU Usage:");
         let mr = at(cpu_left + 82.0, h - 33.0, w - cpu_left - 88.0, 24.0);
         let load = self.engine.cpu().clamp(0.0, 1.0);

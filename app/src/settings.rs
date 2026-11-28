@@ -26,7 +26,10 @@ pub struct AppMapping {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AudioConfig {
+    /// Output system. Older settings use it for both directions.
     pub backend: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub input_backend: String,
     pub device: String,
     pub input_device: String,
     pub sample_rate: f64,
@@ -39,6 +42,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         AudioConfig {
             backend: "Windows Audio".into(),
+            input_backend: String::new(),
             device: String::new(),
             input_device: String::new(),
             sample_rate: 0.0,
@@ -46,6 +50,38 @@ impl Default for AudioConfig {
             input_channels: vec![0, 1],
             output_channels: vec![0, 1],
         }
+    }
+}
+
+impl AudioConfig {
+    pub fn output_asio(&self) -> bool {
+        self.backend == "ASIO"
+    }
+
+    pub fn input_asio(&self) -> bool {
+        if self.input_backend.is_empty() { self.output_asio() } else { self.input_backend == "ASIO" }
+    }
+
+    pub fn set_systems(&mut self, input_asio: bool, output_asio: bool) {
+        let old_input = self.input_asio();
+        let old_output = self.output_asio();
+        if old_input && old_output && input_asio && !output_asio {
+            self.input_device = self.device.clone();
+        } else if old_input != input_asio {
+            self.input_device.clear();
+        }
+        if old_output != output_asio {
+            self.device = if old_input && input_asio && output_asio {
+                self.input_device.clone()
+            } else {
+                String::new()
+            };
+        }
+        if input_asio && output_asio {
+            self.input_device.clear();
+        }
+        self.backend = if output_asio { "ASIO" } else { "Windows Audio" }.into();
+        self.input_backend = if input_asio == output_asio { "" } else if input_asio { "ASIO" } else { "Windows Audio" }.into();
     }
 }
 

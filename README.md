@@ -37,8 +37,10 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 - 🎛️ **Patch canvas**: add processors with a double-click and connect audio and parameter pins with cables.
 - 🔌 **VST2 and VST3 plugins**. The plugin scanner runs each file in a separate process, so a plugin that crashes during a scan can't take the host down.
 - ⚡ **Low-latency audio**:
-  - **ASIO**: the host talks to the driver directly over COM and processes audio inside the driver's buffer-switch callback. Nothing is buffered on top, so latency equals the driver's buffer size.
-  - **WASAPI**: used when no ASIO driver is installed. The input ring is trimmed on every callback so latency doesn't build up.
+  - **ASIO**: the host talks to the driver directly over COM and processes audio inside the driver's buffer-switch callback, without an extra host buffer.
+  - **WASAPI**: Windows shared-mode audio through the system's audio engine.
+- 🔀 **Mixed audio systems**: choose ASIO or Windows Audio (WASAPI) independently for input and output. Cross-system routes bridge the devices and adapt to their sample rates.
+- 📊 **Latency display**: shows plug-in delay on single-system routes and estimates input-to-output latency for mixed routes, including device, bridge and plug-in delays.
 - 🎹 **MIDI**:
   - Map CCs to any plugin parameter, with latch mode and lower/upper bounds.
   - Program Change messages can switch patches.
@@ -101,6 +103,12 @@ pedalhost.exe [file.pdl] [--screenshot out.png]
 5. Click **e** on a processor box to open its editor or **m** to map controls to that processor's parameters.
 
 Settings are stored in `%APPDATA%\PedalboardHost\settings.json`, and the default patch is `default.pdl` in the same folder.
+
+### Mix ASIO and Windows Audio
+
+In **Options → Audio Settings**, choose the **Input system** and **Output system** independently, then select the corresponding devices. When both are ASIO, choose one driver for both directions. The mixed routes support **ASIO input → WASAPI output** and **WASAPI input → ASIO output**. When the devices use different sample rates or run on independent clocks, the host bridges the audio between them.
+
+In mixed mode, **Sample rate** and **Buffer size** configure the ASIO device; Windows Audio uses a supported rate and its own shared-mode buffering. The status bar shows an **estimated** input-to-output latency for mixed routes: input-device delay + bridge buffering + plug-in delay on the longest connected path + output-device delay. It is an estimate, not a guaranteed round-trip measurement. With a single audio system, the status bar continues to show plug-in-path delay only, not device latency.
 
 ### Map a shortcut or controller
 
@@ -201,6 +209,7 @@ Patch files (`.pdl`), plugin state (JUCE base64), mapping XML and colour schemes
 ## Differences from the original
 
 - **VST3 support** (the original hosts VST2 only)
+- Input and output can use ASIO and WASAPI independently, with cross-system audio bridging and estimated end-to-end latency
 - Plugins are scanned in a separate process
 - The Metronome uses the device's actual sample rate instead of assuming 44.1 kHz
 - The Looper keeps loops in memory (up to 120 s). Loops aren't saved with the patch.
