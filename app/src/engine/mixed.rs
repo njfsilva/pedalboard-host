@@ -27,7 +27,7 @@ impl MixedDevice {
                 if info.active_ins.is_empty() { 0 } else { info.in_latency },
                 output.info.sample_rate, output.info.out_latency,
             );
-            let (writer, reader) = bridge::connect(info.active_ins.len(), output.info.sample_rate, info.block.max(output.info.block), timing.clone());
+            let (writer, reader) = bridge::connect(info.active_ins.len(), output.info.sample_rate, info.block.max(super::wasapi::SCRATCH), timing.clone());
             asio.capture_to(writer);
             output.info.in_names = info.in_names;
             output.info.active_ins = info.active_ins;

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const SCRATCH: usize = 4096;
+pub(super) const SCRATCH: usize = 4096;
 const COMMON_RATES: [u32; 8] = [22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000];
 /// Input device setting that turns audio input off.
 pub const NO_INPUT: &str = "<none>";
@@ -86,15 +86,16 @@ unsafe impl Send for OutCb {}
 
 impl OutCb {
     fn render<T: SizedSample + FromSample<f32>>(&mut self, data: &mut [T], info: &cpal::OutputCallbackInfo, rate: f64) {
-        let callback_time = self.mixed.as_ref().map(|reader| {
+        let ow = self.out_width.max(1);
+        let total = data.len() / ow;
+        let callback_time = self.mixed.as_mut().map(|reader| {
+            reader.observe_render_period(total);
             let stamp = info.timestamp();
             if let Some(delay) = stamp.playback.duration_since(&stamp.callback) {
                 reader.timing.set_output(delay);
             }
             Instant::now()
         });
-        let ow = self.out_width.max(1);
-        let total = data.len() / ow;
         data.fill(T::EQUILIBRIUM);
         if let Some(r) = self.ring.as_mut() {
             // Keep input close to real time: drop anything older than about one spare callback.

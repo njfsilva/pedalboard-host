@@ -34,12 +34,12 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 
 ## Features
 
-- 🎛️ **Patch canvas**: add processors with a double-click and connect audio and parameter pins with cables.
+- 🎛️ **Patch canvas**: add processors with a double-click and connect audio and parameter pins with cables. Loaded patches are fitted to the available space.
 - 🔌 **VST2 and VST3 plugins**. The plugin scanner runs each file in a separate process, so a plugin that crashes during a scan can't take the host down.
 - ⚡ **Low-latency audio**:
   - **ASIO**: the host talks to the driver directly over COM and processes audio inside the driver's buffer-switch callback, without an extra host buffer.
   - **WASAPI**: Windows shared-mode audio through the system's audio engine.
-- 🔀 **Mixed audio systems**: choose ASIO or Windows Audio (WASAPI) independently for input and output. Cross-system routes bridge the devices and adapt to their sample rates.
+- 🔀 **Mixed audio systems**: choose ASIO or Windows Audio (WASAPI) independently for input and output. Cross-system routes bridge the devices, adapt to their sample rates and clock drift, and recover from capture dropouts with short fades instead of clicks.
 - 📊 **Latency display**: shows plug-in delay on single-system routes and estimates input-to-output latency for mixed routes, including device, bridge and plug-in delays.
 - 🎹 **MIDI**:
   - Map CCs to any plugin parameter, with latch mode and lower/upper bounds.
@@ -106,7 +106,7 @@ Settings are stored in `%APPDATA%\PedalboardHost\settings.json`, and the default
 
 ### Mix ASIO and Windows Audio
 
-In **Options → Audio Settings**, choose the **Input system** and **Output system** independently, then select the corresponding devices. When both are ASIO, choose one driver for both directions. The mixed routes support **ASIO input → WASAPI output** and **WASAPI input → ASIO output**. When the devices use different sample rates or run on independent clocks, the host bridges the audio between them.
+In **Options → Audio Settings**, choose the **Input system** and **Output system** independently, then select the corresponding devices. When both are ASIO, choose one driver for both directions. The mixed routes support **ASIO input → WASAPI output** and **WASAPI input → ASIO output**. When the devices use different sample rates or run on independent clocks, the host bridges the audio between them. The bridge keeps a small reserve sized from the real capture and render periods, so Windows Audio callbacks of varying length don't cause gaps. If capture stalls or falls behind, the bridge fades out, skips to the newest audio and fades back in.
 
 In mixed mode, **Sample rate** and **Buffer size** configure the ASIO device; Windows Audio uses a supported rate and its own shared-mode buffering. The status bar shows an **estimated** input-to-output latency for mixed routes: input-device delay + bridge buffering + plug-in delay on the longest connected path + output-device delay. It is an estimate, not a guaranteed round-trip measurement. With a single audio system, the status bar continues to show plug-in-path delay only, not device latency.
 
@@ -172,8 +172,10 @@ app/
     ├── app_mappings/     # mapping editor and keyboard shortcut handling
     ├── subwin.rs         # desktop dialogs, prompts and drop-down lists
     ├── builtins.rs       # built-in processors (+ builtins/view.rs for their controls)
-    ├── engine/           # audio engine: asio.rs, wasapi.rs
+    ├── engine/           # audio engine: asio.rs, wasapi.rs, mixed.rs (ASIO + WASAPI),
+    │                     #   bridge.rs (cross-device resampling), latency.rs
     ├── plugins/          # VST2 (vst2.rs), VST3 (vst3/), plugin editor windows
+    ├── plugin_list.rs    # plugin folders, out-of-process scanning and the known plugins
     ├── midi.rs, osc.rs   # MIDI and OSC input
     ├── pdl.rs            # .pdl patch file reading and writing
     ├── presets.rs        # per-processor preset bars and .fxp preset files
@@ -181,6 +183,7 @@ app/
     ├── settings.rs       # settings stored as JSON
     ├── tempo.rs          # tap tempo
     ├── tray.rs           # system tray icon
+    ├── widgets.rs        # shared drawing helpers: fonts, gradient buttons, scrollbars
     └── watchdog.rs       # freeze and crash notes
 ```
 
@@ -192,6 +195,7 @@ app/
 - When a patch changes, the window thread compiles a new **plan** (processing order, buffer pool and pointer tables) and sends it to the audio thread through a lock-free queue (`rtrb`). Plans that are replaced are sent back and freed on the window thread.
 - Denormals are flushed to zero.
 - The audio thread applies MIDI and OSC mappings to processor parameters. The main window handles application commands. Tap Tempo uses the time each input arrived.
+- Mixed routes pass audio between the two devices through lock-free ring buffers. The output side resamples with linear interpolation and steers its rate gently to follow the input clock. Capture losses are marked so the reader never interpolates across a gap, and every jump is covered by a 2 ms fade.
 
 ### Responsiveness
 
