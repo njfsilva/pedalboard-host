@@ -22,10 +22,7 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 - [Features](#features)
 - [Getting started](#getting-started)
 - [Usage](#usage)
-- [Patch and preset management](#patch-and-preset-management)
-- [Built-in processors](#built-in-processors)
-- [Project layout](#project-layout)
-- [Design notes](#design-notes)
+- [Documentation](#documentation)
 - [Differences from the original](#differences-from-the-original)
 - [Status](#status)
 - [License](#license)
@@ -35,25 +32,19 @@ Pedalboard Host is a modern rebuild of **Pedalboard2 v2.09 (64-bit)**, the JUCE-
 ## Features
 
 - 🎛️ **Patch canvas**: add processors with a double-click and connect audio and parameter pins with cables. Loaded patches are fitted to the available space.
-- 🔌 **VST2 and VST3 plugins**. The plugin scanner runs each file in a separate process, so a plugin that crashes during a scan can't take the host down.
-- ⚡ **Low-latency audio**:
-  - **ASIO**: the host talks to the driver directly over COM and processes audio inside the driver's buffer-switch callback, without an extra host buffer.
-  - **WASAPI**: Windows shared-mode audio through the system's audio engine.
-- 🔀 **Mixed audio systems**: choose ASIO or Windows Audio (WASAPI) independently for input and output. Cross-system routes bridge the devices, adapt to their sample rates and clock drift, and recover from capture dropouts with short fades instead of clicks.
-- 📊 **Latency display**: shows plug-in delay on single-system routes and estimates input-to-output latency for mixed routes, including device, bridge and plug-in delays.
-- 🎹 **MIDI**:
-  - Map CCs to any plugin parameter, with latch mode and lower/upper bounds.
-  - Program Change messages can switch patches.
-  - MMC messages can control the transport.
-- 📡 **OSC input** over UDP (default port `5678`), with optional multicast.
-- 🗂️ **Patches**: several patches per `.pdl` file, next/previous switching, and an optional wrap-around from the last patch to the first. Organise patches in bulk, and import or export patches from the organiser.
-- 🎚️ **Presets**: per-plugin preset bars, `.fxp` import/export, and a manager for copying, renaming, importing and removing presets. Built-in processors can save and load presets too.
+- 🔌 **VST2 and VST3 plugins**, scanned in a separate process so a crashing plugin can't take the host down.
+- 🧩 **[Built-in processors](docs/built-in-processors.md)**: level, output toggle, VU meter, file player, recorder, metronome and looper.
+- ⚡ **[Low-latency audio](docs/audio.md)** through ASIO or Windows Audio (WASAPI).
+- 🔀 **[Mixed audio systems](docs/audio.md#mix-asio-and-windows-audio)**: use ASIO and WASAPI independently for input and output, bridged across sample rates and clocks.
+- 📊 **[Latency display](docs/audio.md#latency-display)**: plug-in delay, plus estimated input-to-output latency on mixed routes.
+- 🎹 **[MIDI and OSC control](docs/mappings.md)**: map CCs and OSC messages to plugin parameters, switch patches with Program Change and drive the transport with MMC.
+- 🧰 **[Application mappings](docs/mappings.md#map-a-shortcut-or-controller-to-a-command)**: assign keyboard shortcuts, MIDI CCs and OSC messages to menu, patch and transport commands.
+- 🗂️ **[Patches](docs/patches-and-presets.md)**: several patches per `.pdl` file, next/previous switching with optional wrap-around, and an organiser with import and export.
+- 🎚️ **[Presets](docs/patches-and-presets.md#use-the-processor-preset-bar)**: per-processor preset bars, `.fxp` import/export and a preset manager.
 - ⏱️ **Main transport**: tempo, tap tempo, play/pause and return to zero.
 - 🎨 **Colour schemes**: compatible with Pedalboard2's `.colourscheme` files.
-- 🧰 **Application mappings** let you assign keyboard shortcuts, MIDI CCs and OSC messages to menu, patch and transport commands.
-- 🪟 **Desktop windows** let you place settings, the patch organiser and processor editors outside the main window. They hide and return with the main window.
+- 🪟 **[System tray and desktop windows](docs/system-tray.md)**: keep audio running with the window hidden, and place dialogs and editors outside the main window.
 - 🛟 **Freeze and crash reports**: a watchdog writes a note and a memory snapshot if the window stops responding for 5 s or the program crashes.
-- **System tray** support keeps audio and controller mappings running while the main window is hidden. The icon returns automatically when Windows Explorer restarts.
 
 ## Getting started
 
@@ -70,29 +61,13 @@ cd app
 cargo build --release
 ```
 
-The executable is written to `app/target/release/pedalhost.exe`.
-
-> [!NOTE]
-> Debug builds are also compiled with optimisation (`opt-level = 2`) so the audio path stays fast during development.
-
-### Run tests
-
-```powershell
-cd app
-cargo test
-```
+The executable is written to `app/target/release/pedalhost.exe`. Run the tests with `cargo test`. See the [development notes](docs/development.md) for more.
 
 ## Usage
 
 ```text
-pedalhost.exe [file.pdl] [--screenshot out.png]
+pedalhost.exe [file.pdl]
 ```
-
-| Option | Description |
-|---|---|
-| `<file.pdl>` | Open a patch file at startup |
-| `--screenshot <file.png>` | Draw about 120 frames, save a screenshot of the window, then exit (used for automated checks) |
-| `--scan-plugin <file>` | *Internal.* Prints a description of one plugin file as JSON. The plugin scanner uses this. |
 
 ### Quick start
 
@@ -104,111 +79,17 @@ pedalhost.exe [file.pdl] [--screenshot out.png]
 
 Settings are stored in `%APPDATA%\PedalboardHost\settings.json`, and the default patch is `default.pdl` in the same folder.
 
-### Mix ASIO and Windows Audio
+## Documentation
 
-In **Options → Audio Settings**, choose the **Input system** and **Output system** independently, then select the corresponding devices. When both are ASIO, choose one driver for both directions. The mixed routes support **ASIO input → WASAPI output** and **WASAPI input → ASIO output**. When the devices use different sample rates or run on independent clocks, the host bridges the audio between them. The bridge keeps a small reserve sized from the real capture and render periods, so Windows Audio callbacks of varying length don't cause gaps. If capture stalls or falls behind, the bridge fades out, skips to the newest audio and fades back in.
-
-In mixed mode, **Sample rate** and **Buffer size** configure the ASIO device; Windows Audio uses a supported rate and its own shared-mode buffering. The status bar shows an **estimated** input-to-output latency for mixed routes: input-device delay + bridge buffering + plug-in delay on the longest connected path + output-device delay. It is an estimate, not a guaranteed round-trip measurement. With a single audio system, the status bar continues to show plug-in-path delay only, not device latency.
-
-### Map a shortcut or controller
-
-Open **Options → Application Mappings** and click **+** beside a command, such as **Patch → Next Patch** or **Main Transport → Tap Tempo**. Choose an input, then click **OK**.
-
-| Input | How to assign it |
+| Guide | Covers |
 |---|---|
-| Keyboard | Choose **Add Key Mapping** and press the shortcut. If another command uses it, confirming moves the shortcut to the new command. |
-| MIDI footswitch or controller | Choose **Add MIDI CC Mapping**. Select **MIDI Learn** and operate the control, or pick its CC number. Leave **Channel** on **Any** or choose 1–16. Each matching CC message with a value of 65–127 runs the command. |
-| OSC | Choose **Add Open Sound Control Mapping**. Type an address such as `/pedalboard/next` or pick one from **Received addresses**. **Parameter** counts float arguments from zero. The command runs when the selected float exceeds 0.5. |
-
-Select MIDI devices in **Options → Audio Settings**. For OSC, enable **OSC Input** and set the UDP port in **Options → Misc Settings**. To remove one assignment, click it and choose **Remove Mapping**. **Reset to defaults** clears custom assignments and restores the original keyboard shortcuts.
-
-Application mappings apply across patches and are saved in `%APPDATA%\PedalboardHost\AppMappings.xml`. On first use, the host imports any existing Pedalboard2 application mappings and controller assignments from older rebuild settings.
-
-### Run from the system tray
-
-On a fresh install, the main window opens and the tray icon appears. With the icon active, closing the main window or choosing **File → Exit** hides it while audio and MIDI/OSC controls keep running. Double-click the icon to show or hide the window. To exit the host, right-click the icon and choose **Quit**. The host prompts you to save any unsaved patch changes.
-
-To launch with the window hidden, enable **Start in tray** under **Options → Misc Settings** with **Display tray icon** enabled.
-
-## Patch and preset management
-
-Use **Edit → Organise patches** to rename, copy, remove or reorder patches. The organiser also imports patches from another `.pdl` file and exports selected patches to a separate `.pdl` file. The currently playing patch stays selected when patches are reordered; importing a patch adds it to the open set without switching away from the current patch.
-
-Open a processor's editor to use its **Presets** bar. Choose a plugin program or a saved preset from the list, type a name and use **Save** to store the current sound. **Import** loads an `.fxp` file into the current processor; it does not add that file to the saved-preset list.
-
-Use **Edit → User Preset Management** (or **User presets...** from a processor's context menu) to manage saved presets. Select a preset to rename, copy, remove, import an `.fxp` file into that plugin's library, or export it to a file. Presets are shared with the original Pedalboard2 and are stored under `%APPDATA%\Pedalboard2\presets\`, in a folder for each plugin. Built-in processor presets use the same manager.
-
-See the [patch and preset guide](docs/patches-and-presets.md) for the workflows and file locations in more detail. The [mechanics notes](app/MECHANICS.md) document implementation details and compatibility behavior.
-
-## Built-in processors
-
-| Processor | I/O | Description |
-|---|---|---|
-| **Level** | 2 in / 2 out | Gain dial, 0–2× (unity at the centre) |
-| **Output Toggle** | 1 in / 2 out | Crossfades the signal between two outputs |
-| **VU Meter** | 2 in | Stereo peak meter with an over light |
-| **File Player** | 2 out | Plays WAV/AIFF files, with looping and sync to the main transport |
-| **Audio Recorder** | 2 in | Records 16-bit stereo WAV at the device's sample rate |
-| **Metronome** | 1 out | Sine clicks or custom accent/click samples, any time signature |
-| **Looper** | 2 in / 2 out | Bar-quantised looping with auto-play, input/loop levels and seamless crossfaded joins |
-
-## Project layout
-
-```text
-app/
-├── Cargo.toml            # crate "pedalhost"
-├── MECHANICS.md          # values from the original program and how the rebuild uses them
-├── mechanics.json        # the same values in machine-readable form
-├── vendor/webbrowser/    # patched crate (avoids linking shlwapi on the GNU toolchain)
-└── src/
-    ├── main.rs           # entry point, fonts, 1 ms timer precision
-    ├── app.rs            # main application state and patch handling
-    ├── field.rs          # plugin canvas: boxes, pins and cables
-    ├── graph.rs          # processing graph and the precompiled plan
-    ├── bars.rs           # menu bar and bottom transport bar
-    ├── dialogs.rs        # settings, built-in and generic processor editors
-    ├── editors.rs        # processor mappings, patch organiser and preset manager
-    ├── app_mappings.rs   # application commands and AppMappings.xml
-    ├── app_mappings/     # mapping editor and keyboard shortcut handling
-    ├── subwin.rs         # desktop dialogs, prompts and drop-down lists
-    ├── builtins.rs       # built-in processors (+ builtins/view.rs for their controls)
-    ├── engine/           # audio engine: asio.rs, wasapi.rs, mixed.rs (ASIO + WASAPI),
-    │                     #   bridge.rs (cross-device resampling), latency.rs
-    ├── plugins/          # VST2 (vst2.rs), VST3 (vst3/), plugin editor windows
-    ├── plugin_list.rs    # plugin folders, out-of-process scanning and the known plugins
-    ├── midi.rs, osc.rs   # MIDI and OSC input
-    ├── pdl.rs            # .pdl patch file reading and writing
-    ├── presets.rs        # per-processor preset bars and .fxp preset files
-    ├── colours.rs        # colour schemes and JUCE-style colour maths
-    ├── settings.rs       # settings stored as JSON
-    ├── tempo.rs          # tap tempo
-    ├── tray.rs           # system tray icon
-    ├── widgets.rs        # shared drawing helpers: fonts, gradient buttons, scrollbars
-    └── watchdog.rs       # freeze and crash notes
-```
-
-## Design notes
-
-### Real-time audio
-
-- The audio callback **never allocates, takes a lock or frees memory**.
-- When a patch changes, the window thread compiles a new **plan** (processing order, buffer pool and pointer tables) and sends it to the audio thread through a lock-free queue (`rtrb`). Plans that are replaced are sent back and freed on the window thread.
-- Denormals are flushed to zero.
-- The audio thread applies MIDI and OSC mappings to processor parameters. The main window handles application commands. Tap Tempo uses the time each input arrived.
-- Mixed routes pass audio between the two devices through lock-free ring buffers. The output side resamples with linear interpolation and steers its rate gently to follow the input clock. Capture losses are marked so the reader never interpolates across a gap, and every jump is covered by a 2 ms fade.
-
-### Responsiveness
-
-- Requests **1 ms timer precision** (`timeBeginPeriod(1)`) and opts out of Windows 11 power throttling. Without this, plugin GUIs that pace themselves with timers drop from about 49 fps to about 13 fps.
-- VST2 editors get an idle call every 10 ms from a dedicated ticker thread.
-- Vsync is off because plugin windows share the main window's thread.
-- ASIO driver reset requests are debounced by 500 ms, as in the original. As an extra guard, automatic restarts are limited to 4 in any 15 seconds, so a driver that keeps asking to be reset can't hang the program.
-
-### Fidelity to the original
-
-The UI recreates Pedalboard2's layout, colours, fonts (Verdana) and JUCE's software colour blending. The values come from the original binary and from measurements of its screenshots. [`app/MECHANICS.md`](app/MECHANICS.md) lists each value with its source address, and marks the ones that were estimated.
-
-Patch files (`.pdl`), plugin state (JUCE base64), mapping XML and colour schemes use the original's formats.
+| [Audio setup and latency](docs/audio.md) | ASIO and WASAPI, mixing systems, the audio bridge, the latency display and how the engine works |
+| [MIDI, OSC and application mappings](docs/mappings.md) | Controller inputs, parameter mappings and command shortcuts |
+| [Patch and preset management](docs/patches-and-presets.md) | The patch organiser, preset bars, the preset library and file locations |
+| [Built-in processors](docs/built-in-processors.md) | The processors included with the host |
+| [System tray](docs/system-tray.md) | Running hidden, starting in the tray and desktop windows |
+| [Development notes](docs/development.md) | Building, command-line options, project layout and design notes |
+| [Mechanics notes](app/MECHANICS.md) | Values taken from the original program and compatibility details |
 
 ## Differences from the original
 
