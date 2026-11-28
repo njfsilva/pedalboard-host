@@ -129,6 +129,7 @@ Colour-scheme files:
   - Pin labels also step 12 px (measured from the original's picture).
   - Pin names are "Input N" / "Output N", or none when "Ignore pin names" is on. The MIDI/parameter pin is "param".
 - **Cables (paint 0x1400767e0, shape 0x140076c90, hit test 0x140076a10, endpoints 0x140076a70):**
+  - Holding Shift at the start of an audio cable drag connects successive channel pairs from the chosen pins until either box runs out of audio channels. Existing cables are kept. The gesture follows the supplied original's `PluginPinComponent::mouseDown`, `PluginField::releaseConnection` and `PluginField::connectAll`.
   - The centre line runs from pin centre to pin centre (each pin component's position + (5, 6)). It is a cubic whose two control points sit at the horizontal midpoint (factor 0.5 at 0x14042ee44), level with each end.
   - It is stroked into a 9 px band (0x140438b98) with mitered joints and round ends.
   - Painting: first a 1 px black stroke around the band (Colours::black, width 0x14042ee48), or a 4 px red one when selected (Colours::red, width 0x14042f204), instead of the black. Then the band is filled with the Audio or Parameter Connection colour, brightened by 0.75 under the mouse (0x140433888).

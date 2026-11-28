@@ -820,6 +820,21 @@ impl App {
                 if let Some(i) = info {
                     ui.label(format!("Audio: {} ({}), {} Hz, {} samples", i.name, i.backend, i.sample_rate, i.block));
                 }
+                ui.collapsing("Missing features from Pedalboard2 for Windows", |ui| {
+                    for (area, detail) in [
+                        ("Looper", "The original saves and reopens loop recordings as sound files. This Looper keeps takes in memory and limits them to two minutes."),
+                        ("Sound files", "The File Player and Metronome read WAV and AIFF. FLAC, Ogg Vorbis and WMA playback are missing, as are the recent-file lists in the File Player and Recorder."),
+                        ("Drag and drop", "The original lets you drop a patch file to open it, or drop a sound file or VST plugin onto the board to add it. Here, use File → Open for patches and double-click the board to add a processor."),
+                        ("MIDI routing", "Missing controls include filtering all notes for a plugin by MIDI channel, overriding its built-in controller assignments, and sending MIDI from one plugin into another."),
+                        ("OSC controllers", "The original can send MIDI notes to an instrument over OSC. When mapping a plugin knob, it also lets you pick a recently received address and choose which value in a message controls the knob. Here, you type the address and the first numeric value controls the knob."),
+                        ("Patch layout", "The original remembers which plugin editors were open and where you put them. Here, you reopen editors by hand. The board also uses numbered inputs and outputs even when a plugin provides names for them."),
+                        ("Audio and network setup", "DirectSound, the output test tone and the local IP address shown in the original’s About window are missing."),
+                    ] {
+                        ui.strong(area);
+                        ui.label(detail);
+                        ui.add_space(4.0);
+                    }
+                });
             });
             self.dlg.about = !close;
         }
@@ -827,7 +842,7 @@ impl App {
             let close = subwin::show(ctx, Spec::new(subwin::id("docs"), "Documentation", Kind::fit(460.0)).escape(), |ui| {
                 for line in [
                     "Double-click an empty part of the pedalboard to add a built-in processor or a plugin.",
-                    "Drag from an output pin to an input pin to connect two boxes. Click a cable to select it (Ctrl-click adds more) and press Delete to remove it.",
+                    "Drag from an output pin to an input pin to connect two boxes. Hold Shift when starting the drag to connect the following audio channels in pairs. Click a cable to select it (Ctrl-click adds more) and press Delete to remove it.",
                     "Connect Midi Input or OSC Input to a box's param pin, then use the mappings button to tie controllers to its parameters.",
                     "In Options > Application Mappings, click + beside a command to set a shortcut, learn a MIDI controller, or assign an OSC address. Click an assignment to remove it.",
                     "Switch patches with the patch selector or the - and + buttons; Edit > Organise patches renames and reorders them.",

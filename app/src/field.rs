@@ -47,6 +47,32 @@ struct Pin {
     at: Pos2,
 }
 
+#[derive(Clone, Copy)]
+struct WireDrag {
+    start: Pin,
+    follow_channels: bool,
+}
+
+impl WireDrag {
+    fn connect(self, target: Pin, graph: &mut Graph) -> Option<Action> {
+        let (src, dst) = if self.start.out { (self.start, target) } else { (target, self.start) };
+        let source = graph.node(src.node)?;
+        let destination = graph.node(dst.node)?;
+        let sc = source.out_channel(src.pin);
+        let dc = destination.in_channel(dst.pin);
+        let pairs = if self.follow_channels && !src.param {
+            source.outs.saturating_sub(src.pin).min(destination.ins.saturating_sub(dst.pin))
+        } else {
+            1
+        };
+        let mut connected = false;
+        for offset in 0..pairs as u32 {
+            connected |= graph.connect(src.node, sc + offset, dst.node, dc + offset);
+        }
+        connected.then_some(Action::Connected(src.node, dst.node, src.param))
+    }
+}
+
 /// The one open menu: the add panel (its screen corner, and where a new box goes in the field)
 /// or a processor box's menu (and whether its Programs list is open).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,7 +125,7 @@ pub struct Field {
     fit_pending: bool,
     fit_scale: Option<f32>,
     pub selected: Vec<(u32, u32, u32, u32)>,
-    wire: Option<Pin>,
+    wire: Option<WireDrag>,
     /// The open menu, and the rectangles it covered when last drawn (the menu, then its list).
     popup: Option<Popup>,
     popup_rects: Vec<Rect>,
@@ -515,7 +541,7 @@ impl Field {
                     let name = if out { n.out_name(k) } else { n.in_name(k) };
                     let pr = fu.interact(hit, id.with(("pin", nid, out, k)), Sense::drag()).on_hover_text(name);
                     if pr.drag_started() {
-                        self.wire = Some(pin);
+                        self.wire = Some(WireDrag { start: pin, follow_channels: fu.input(|i| i.modifiers.shift) });
                     }
                 }
             }
@@ -573,7 +599,8 @@ impl Field {
         if self.rename.as_ref().is_some_and(|e| g.node(e.0).is_none()) {
             self.rename = None;
         }
-        if let Some(w) = self.wire {
+        if let Some(drag) = self.wire {
+            let w = drag.start;
             let m = fu.input(|i| i.pointer.interact_pos()).map_or(w.at, |pos| from_screen * pos);
             let target = pins.iter().filter(|q| q.out != w.out && q.param == w.param && q.node != w.node).min_by(|a, b| a.at.distance(m).total_cmp(&b.at.distance(m))).filter(|q| q.at.distance(m) < 14.0).copied();
             let end = target.map(|t| t.at).unwrap_or(m);
@@ -582,14 +609,8 @@ impl Field {
             paint_cable(&p, pts, col, false);
             if !fu.input(|i| i.pointer.any_down()) {
                 self.wire = None;
-                if let Some(t) = target {
-                    let (s, d) = if w.out { (w, t) } else { (t, w) };
-                    let chans = g.node(s.node).zip(g.node(d.node)).map(|(sn, dn)| (sn.out_channel(s.pin), dn.in_channel(d.pin)));
-                    if let Some((sc, dc)) = chans {
-                        if g.connect(s.node, sc, d.node, dc) {
-                            act.push(Action::Connected(s.node, d.node, w.param));
-                        }
-                    }
+                if let Some(action) = target.and_then(|pin| drag.connect(pin, g)) {
+                    act.push(action);
                 }
             }
         }
@@ -853,8 +874,11 @@ mod tests {
             rig
         }
         fn frame(&mut self, events: Vec<Event>) -> Vec<Action> {
+            self.frame_with_modifiers(events, Modifiers::NONE)
+        }
+        fn frame_with_modifiers(&mut self, events: Vec<Event>, modifiers: Modifiers) -> Vec<Action> {
             self.t += 0.05;
-            let input = RawInput { time: Some(self.t), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1024.0, 600.0))), events, ..Default::default() };
+            let input = RawInput { time: Some(self.t), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1024.0, 600.0))), events, modifiers, ..Default::default() };
             let (field, g, field_r) = (&mut self.field, &mut self.g, &mut self.field_r);
             let mut acts = Vec::new();
             let _ = self.ctx.run(input, |ctx| {
@@ -911,6 +935,25 @@ mod tests {
 
     fn renamed(acts: &[Action]) -> bool {
         acts.iter().any(|a| matches!(a, Action::Renamed))
+    }
+
+    #[test]
+    fn shift_at_the_start_of_a_cable_drag_connects_following_audio_channels() {
+        let mut rig = Rig::new();
+        let src = rig.g.add_builtin(Kind::Level, pos2(200.0, 200.0), &gctx());
+        let dst = rig.g.add_builtin(Kind::Level, pos2(400.0, 200.0), &gctx());
+        let width = builtin_box(0.0, Kind::Level.control_size()).x;
+        let output = rig.at(200.0 + width - 2.0, 200.0 + PIN0);
+        let input = rig.at(402.0, 200.0 + PIN0);
+        for (modifiers, expected) in [(Modifiers::NONE, 1), (Modifiers::SHIFT, 2)] {
+            rig.frame(vec![Event::PointerMoved(output)]);
+            rig.frame_with_modifiers(vec![Event::PointerButton { pos: output, button: PointerButton::Primary, pressed: true, modifiers }], modifiers);
+            rig.frame(vec![Event::PointerMoved(input)]);
+            let acts = rig.button(input, PointerButton::Primary, false);
+            assert!(acts.iter().any(|a| matches!(a, Action::Connected(s, d, false) if (*s, *d) == (src, dst))));
+            assert_eq!(rig.g.conns.len(), expected);
+        }
+        assert_eq!(rig.g.conns, [(src, 0, dst, 0), (src, 1, dst, 1)]);
     }
 
     #[test]

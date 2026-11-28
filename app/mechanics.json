@@ -89,6 +89,7 @@
     {"name": "hovered cable brighten", "group": "boxes", "value": 0.75, "source": "function 0x1400767e0 (0x140433888)"},
     {"name": "cable curve", "group": "boxes", "value": "cubic, both control points at the horizontal midpoint", "source": "function 0x140076c90 (factor 0.5 at 0x14042ee44)"},
     {"name": "cable width", "group": "boxes", "value": 9, "unit": "px", "source": "function 0x140076c90 (0x140438b98, rounded end caps)"},
+    {"name": "Shift held at the start of an audio cable drag", "group": "boxes", "value": "connect successive pairs from the selected pins until either side runs out of audio channels", "source": "supplied original source, PluginPinComponent::mouseDown and PluginField::connectAll"},
     {"name": "cable hit tolerance", "group": "boxes", "value": 1, "unit": "px", "source": "function 0x140076a10"},
     {"name": "cable end at pin", "group": "boxes", "value": "pin centre", "source": "functions 0x140076a70 (pin position + (5, 6)) and 0x140075510"},
     {"name": "cables above boxes", "group": "boxes", "value": true, "source": "functions 0x14007dd40 and 0x140080500 (added after the boxes, never sent to the back)"},
